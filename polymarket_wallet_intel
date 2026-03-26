@@ -22,6 +22,7 @@ UTC = timezone.utc
 # Environment
 # =========================================================
 DATA_API_BASE = os.getenv("DATA_API_BASE", "https://data-api.polymarket.com")
+DATA_API_V1_BASE = os.getenv("DATA_API_V1_BASE", f"{DATA_API_BASE}/v1")
 GAMMA_BASE = os.getenv("GAMMA_BASE", "https://gamma-api.polymarket.com")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -232,7 +233,7 @@ def send_telegram(text: str) -> None:
 # Public Polymarket fetchers
 # =========================================================
 def fetch_leaderboard_wallets(limit: int) -> List[Dict[str, Any]]:
-    rows = fetch_list(f"{DATA_API_BASE}/leaderboard", params={"limit": limit})
+    rows = fetch_list(f"{DATA_API_V1_BASE}/leaderboard", params={"limit": min(limit, 50), "timePeriod": "MONTH", "orderBy": "PNL", "category": "OVERALL"})
     out: List[Dict[str, Any]] = []
     for row in rows:
         wallet = str(row.get("proxyWallet") or row.get("wallet") or row.get("user") or "").strip()
@@ -284,13 +285,29 @@ def fetch_top_holders_for_market(market: Dict[str, Any], limit: int) -> List[Dic
         if rows:
             out: List[Dict[str, Any]] = []
             for row in rows:
+                nested_holders = row.get("holders")
+                if isinstance(nested_holders, list):
+                    for holder in nested_holders:
+                        if not isinstance(holder, dict):
+                            continue
+                        wallet = str(holder.get("proxyWallet") or holder.get("wallet") or holder.get("user") or "").strip()
+                        if not wallet:
+                            continue
+                        out.append({
+                            "wallet": wallet,
+                            "source": "holders",
+                            "holder_size": safe_float(holder.get("amount") or holder.get("size") or holder.get("balance") or holder.get("shares"), 0.0),
+                            "market_slug": clean_text(market.get("slug")),
+                            "market_question": clean_text(market.get("question")),
+                        })
+                    continue
                 wallet = str(row.get("proxyWallet") or row.get("wallet") or row.get("user") or "").strip()
                 if not wallet:
                     continue
                 out.append({
                     "wallet": wallet,
                     "source": "holders",
-                    "holder_size": safe_float(row.get("size") or row.get("balance") or row.get("shares"), 0.0),
+                    "holder_size": safe_float(row.get("amount") or row.get("size") or row.get("balance") or row.get("shares"), 0.0),
                     "market_slug": clean_text(market.get("slug")),
                     "market_question": clean_text(market.get("question")),
                 })
