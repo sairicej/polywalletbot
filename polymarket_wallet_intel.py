@@ -1072,8 +1072,7 @@ def format_scan_text(result: Dict[str, Any], manual: bool = False) -> str:
             lines.append("")
     else:
         lines.append("None")
-    return "
-".join(lines).strip()
+    return "\n".join(lines).strip()
 
 
 def format_group_text(group_payload: Dict[str, Any]) -> str:
