@@ -1458,4 +1458,4 @@ def webhook_route():
 
 if __name__ == "__main__":
     ensure_background_started()
-    app.run(host="0.0.0.0", port=PORT
+    app.run(host="0.0.0.0", port=PORT)
