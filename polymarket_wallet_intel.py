@@ -16,7 +16,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "wallet-intel-v4-fastmanual-usernames"
+SCRIPT_VERSION = "wallet-intel-v5-nosports"
 UTC = timezone.utc
 
 # =========================================================
@@ -40,6 +40,7 @@ LEADERBOARD_LIMIT = int(os.getenv("LEADERBOARD_LIMIT", "100"))
 ACTIVE_MARKET_LIMIT = int(os.getenv("ACTIVE_MARKET_LIMIT", "40"))
 HOLDERS_PER_MARKET = int(os.getenv("HOLDERS_PER_MARKET", "15"))
 MAX_CANDIDATE_WALLETS = int(os.getenv("MAX_CANDIDATE_WALLETS", "120"))
+EXCLUDE_SPORTS_WALLETS = os.getenv("EXCLUDE_SPORTS_WALLETS", "true").lower() == "true"
 TOP_WALLETS_PER_SCAN = int(os.getenv("TOP_WALLETS_PER_SCAN", "8"))
 TOP_WALLETS_PER_GROUP = int(os.getenv("TOP_WALLETS_PER_GROUP", "10"))
 
@@ -475,6 +476,8 @@ def discover_candidate_wallets(leaderboard_limit: Optional[int] = None, active_m
     stats["leaderboard_wallets"] = len(candidates)
 
     active_markets = fetch_active_markets(active_market_limit)
+    if EXCLUDE_SPORTS_WALLETS:
+        active_markets = [m for m in active_markets if not is_sports_row(m)]
     stats["active_markets"] = len(active_markets)
     for market in active_markets:
         holders = fetch_top_holders_for_market(market, holders_per_market)
@@ -887,6 +890,9 @@ def reason_strings(metrics: Dict[str, Any]) -> Tuple[List[str], List[str]]:
 
     if metrics.get("trade_count_capped"):
         weak.append("trade count hit cap, so activity may be understated")
+    sports_total = safe_int(metrics.get("sports_closed_positions_30d"), 0) + safe_int(metrics.get("sports_trades_30d"), 0) + safe_int(metrics.get("sports_current_positions"), 0)
+    if sports_total > 0:
+        weak.append(f"sports exposure seen in sample ({sports_total})")
     if metrics.get("no_losers_seen"):
         weak.append("no losers seen in sample, so perfection may be overstated")
 
@@ -902,6 +908,10 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
     trades = fetch_trades(wallet)
     current_positions = fetch_current_positions(wallet)
 
+    sports_rows_30d = 0
+    sports_trade_rows_30d = 0
+    sports_current_positions = 0
+
     closed_30d: List[Dict[str, Any]] = []
     trade_30d: List[Dict[str, Any]] = []
     recent_trades_7d = 0
@@ -911,6 +921,8 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
         if ts is None or ts < cutoff_30d:
             continue
         closed_30d.append(row)
+        if EXCLUDE_SPORTS_WALLETS and is_sports_row(row):
+            sports_rows_30d += 1
 
     for row in trades:
         ts = parse_ts(row.get("timestamp") or row.get("time") or row.get("createdAt") or row.get("updatedAt"))
@@ -918,8 +930,15 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
             continue
         if ts >= cutoff_30d:
             trade_30d.append(row)
+            if EXCLUDE_SPORTS_WALLETS and is_sports_row(row):
+                sports_trade_rows_30d += 1
         if ts >= cutoff_7d:
             recent_trades_7d += 1
+
+    if EXCLUDE_SPORTS_WALLETS:
+        for row in current_positions:
+            if is_sports_row(row):
+                sports_current_positions += 1
 
     weighted_pnl = 0.0
     weighted_cost = 0.0
@@ -983,6 +1002,9 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "consistency_ratio_30d": consistency_ratio,
         "intraday_roundtrips_30d": intraday_roundtrips,
         "losing_positions_30d": losing_positions,
+        "sports_closed_positions_30d": sports_rows_30d,
+        "sports_trades_30d": sports_trade_rows_30d,
+        "sports_current_positions": sports_current_positions,
         "obs_sample_1h": safe_int(obs.get("sample_1h"), 0),
         "obs_sample_6h": safe_int(obs.get("sample_6h"), 0),
         "obs_sample_24h": safe_int(obs.get("sample_24h"), 0),
@@ -996,6 +1018,16 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
     metrics["bucket"] = classify_bucket(metrics)
     metrics["good_reasons"], metrics["weak_reasons"] = reason_strings(metrics)
 
+    sports_ok = (
+        not EXCLUDE_SPORTS_WALLETS
+        or (
+            sports_rows_30d == 0
+            and sports_trade_rows_30d == 0
+            and sports_current_positions == 0
+            and not any(is_sports_text(clean_text(m.get("slug") or m.get("question") or "")) for m in (candidate.get("holder_markets") or []))
+        )
+    )
+
     passes = (
         metrics["closed_positions_30d"] >= MIN_CLOSED_POSITIONS_30D
         and metrics["trades_30d"] >= MIN_TRADES_30D
@@ -1004,6 +1036,7 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
         and metrics["consistency_ratio_30d"] >= MIN_CONSISTENCY_RATIO
         and metrics["realized_pnl_30d"] >= MIN_REALIZED_PNL_30D
         and metrics["recent_trades_7d"] >= MIN_RECENT_TRADES_7D
+        and sports_ok
     )
     metrics["passes_filters"] = passes
     return metrics
