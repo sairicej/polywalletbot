@@ -16,7 +16,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "wallet-intel-v3-realdata"
+SCRIPT_VERSION = "wallet-intel-v4-fastmanual-usernames"
 UTC = timezone.utc
 
 # =========================================================
@@ -42,6 +42,14 @@ HOLDERS_PER_MARKET = int(os.getenv("HOLDERS_PER_MARKET", "15"))
 MAX_CANDIDATE_WALLETS = int(os.getenv("MAX_CANDIDATE_WALLETS", "120"))
 TOP_WALLETS_PER_SCAN = int(os.getenv("TOP_WALLETS_PER_SCAN", "8"))
 TOP_WALLETS_PER_GROUP = int(os.getenv("TOP_WALLETS_PER_GROUP", "10"))
+
+# Manual quick scan limits
+MANUAL_LEADERBOARD_LIMIT = int(os.getenv("MANUAL_LEADERBOARD_LIMIT", "25"))
+MANUAL_ACTIVE_MARKET_LIMIT = int(os.getenv("MANUAL_ACTIVE_MARKET_LIMIT", "20"))
+MANUAL_HOLDERS_PER_MARKET = int(os.getenv("MANUAL_HOLDERS_PER_MARKET", "10"))
+MANUAL_MAX_CANDIDATE_WALLETS = int(os.getenv("MANUAL_MAX_CANDIDATE_WALLETS", "24"))
+MANUAL_SCAN_DEADLINE_SECONDS = int(os.getenv("MANUAL_SCAN_DEADLINE_SECONDS", "45"))
+MANUAL_SEND_CACHED_FIRST = os.getenv("MANUAL_SEND_CACHED_FIRST", "true").lower() == "true"
 
 # Snapshot grading
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "30"))
@@ -430,7 +438,7 @@ def fetch_market_snapshot(slug: str = "", condition_id: str = "") -> Optional[Di
 # =========================================================
 # Wallet discovery
 # =========================================================
-def discover_candidate_wallets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def discover_candidate_wallets(leaderboard_limit: Optional[int] = None, active_market_limit: Optional[int] = None, holders_per_market: Optional[int] = None, max_candidate_wallets: Optional[int] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     candidates: Dict[str, Dict[str, Any]] = {}
     stats = {
         "leaderboard_wallets": 0,
@@ -439,7 +447,12 @@ def discover_candidate_wallets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "unique_candidate_wallets": 0,
     }
 
-    for row in fetch_leaderboard_wallets(LEADERBOARD_LIMIT):
+    leaderboard_limit = leaderboard_limit or LEADERBOARD_LIMIT
+    active_market_limit = active_market_limit or ACTIVE_MARKET_LIMIT
+    holders_per_market = holders_per_market or HOLDERS_PER_MARKET
+    max_candidate_wallets = max_candidate_wallets or MAX_CANDIDATE_WALLETS
+
+    for row in fetch_leaderboard_wallets(leaderboard_limit):
         wallet = row["wallet"]
         base = candidates.setdefault(
             wallet,
@@ -461,10 +474,10 @@ def discover_candidate_wallets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             base["username"] = row["username"]
     stats["leaderboard_wallets"] = len(candidates)
 
-    active_markets = fetch_active_markets(ACTIVE_MARKET_LIMIT)
+    active_markets = fetch_active_markets(active_market_limit)
     stats["active_markets"] = len(active_markets)
     for market in active_markets:
-        holders = fetch_top_holders_for_market(market, HOLDERS_PER_MARKET)
+        holders = fetch_top_holders_for_market(market, holders_per_market)
         stats["holder_wallets"] += len(holders)
         for row in holders:
             wallet = row["wallet"]
@@ -501,7 +514,7 @@ def discover_candidate_wallets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         )
     )
     stats["unique_candidate_wallets"] = len(deduped)
-    return deduped[:MAX_CANDIDATE_WALLETS], stats
+    return deduped[:max_candidate_wallets], stats
 
 
 # =========================================================
@@ -1018,8 +1031,10 @@ def row_discovery_text(row: Dict[str, Any]) -> str:
 def format_wallet_row(row: Dict[str, Any]) -> List[str]:
     wallet = clean_text(row.get("wallet") or "")
     profile_url = f"https://polymarket.com/profile/{wallet}" if wallet else ""
+    username = clean_text(row.get("username") or "")
     lines = [
         f"Wallet: {display_name(row)}",
+        f"Username: {username or 'none'}",
         f"Address: {wallet or 'unknown'}",
         f"Profile: {profile_url or 'none'}",
         f"Bucket: {row.get('bucket', 'UNKNOWN')} | Score: {safe_float(row.get('score'), 0.0):.1f}",
@@ -1038,6 +1053,30 @@ def format_wallet_row(row: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def latest_cached_scan_text() -> str:
+    with state_lock:
+        history = runtime_state.get("scan_history", [])
+    if not history:
+        return "Latest cached candidates\nNone yet"
+    last = history[-1]
+    rows = last.get("top_wallets") or []
+    lines = [
+        "Latest cached candidates while fresh scan runs",
+        f"script_version={SCRIPT_VERSION}",
+        f"cached_timestamp={clean_text(last.get('timestamp') or '')}",
+    ]
+    if rows:
+        for row in rows[:TOP_WALLETS_PER_SCAN]:
+            wallet = clean_text(row.get("wallet") or "")
+            username = clean_text(row.get("username") or "none")
+            score = safe_float(row.get("score"), 0.0)
+            bucket = clean_text(row.get("bucket") or "UNKNOWN")
+            lines.append(f"{display_name(row)} | username={username} | {wallet} | bucket={bucket} | score={score:.1f} | profile=https://polymarket.com/profile/{wallet}")
+    else:
+        lines.append("None")
+    return "\n".join(lines).strip()
+
+
 def format_scan_text(result: Dict[str, Any], manual: bool = False) -> str:
     header = "Manual wallet scan" if manual else "Auto wallet scan"
     lines = [
@@ -1046,6 +1085,7 @@ def format_scan_text(result: Dict[str, Any], manual: bool = False) -> str:
         f"evaluated_wallets={result.get('evaluated_wallets', 0)} | passing_wallets={result.get('passing_wallets', 0)} | evaluation_errors={result.get('evaluation_errors', 0)}",
         f"leaderboard_wallets={result.get('leaderboard_wallets', 0)} | active_markets={result.get('active_markets', 0)} | holder_wallets={result.get('holder_wallets', 0)} | unique_candidates={result.get('unique_candidate_wallets', 0)}",
         f"observations_logged={result.get('observations_logged', 0)} | obs_eval_1h={result.get('obs_eval_1h', 0)} | obs_eval_6h={result.get('obs_eval_6h', 0)} | obs_eval_24h={result.get('obs_eval_24h', 0)}",
+        f"scan_runtime_seconds={safe_float(result.get('scan_runtime_seconds'), 0.0):.2f} | time_budget_hit={str(bool(result.get('time_budget_hit', False))).lower()}",
         "",
         "Wallets to test first",
     ]
@@ -1087,7 +1127,7 @@ def format_group_text(group_payload: Dict[str, Any]) -> str:
     if top:
         for row in top:
             lines.append(
-                f"{display_name(row)} | {clean_text(row.get('wallet') or '')} | seen={safe_int(row.get('seen_count'), 0)} | best_score={safe_float(row.get('best_score'), 0.0):.1f} | best_bucket={row.get('best_bucket', 'UNKNOWN')} | profile=https://polymarket.com/profile/{clean_text(row.get('wallet') or '')}"
+                f"{display_name(row)} | username={clean_text(row.get('username') or 'none')} | {clean_text(row.get('wallet') or '')} | seen={safe_int(row.get('seen_count'), 0)} | best_score={safe_float(row.get('best_score'), 0.0):.1f} | best_bucket={row.get('best_bucket', 'UNKNOWN')} | profile=https://polymarket.com/profile/{clean_text(row.get('wallet') or '')}"
             )
     else:
         lines.append("None")
@@ -1097,7 +1137,7 @@ def format_group_text(group_payload: Dict[str, Any]) -> str:
     if observed:
         for row in observed:
             lines.append(
-                f"{display_name(row)} | {clean_text(row.get('wallet') or '')} | 24h_success={safe_float(row.get('success_rate_24h'), 0.0):.1%} | sample={safe_int(row.get('sample_24h'), 0)} | avg_24h_move={safe_float(row.get('avg_move_24h'), 0.0):.1%} | profile=https://polymarket.com/profile/{clean_text(row.get('wallet') or '')}"
+                f"{display_name(row)} | username={clean_text(row.get('username') or 'none')} | {clean_text(row.get('wallet') or '')} | 24h_success={safe_float(row.get('success_rate_24h'), 0.0):.1%} | sample={safe_int(row.get('sample_24h'), 0)} | avg_24h_move={safe_float(row.get('avg_move_24h'), 0.0):.1%} | profile=https://polymarket.com/profile/{clean_text(row.get('wallet') or '')}"
             )
     else:
         lines.append("None")
@@ -1120,7 +1160,7 @@ def health_text() -> str:
         lines.append("Observed 24h leaders")
         for row in observed:
             lines.append(
-                f"{display_name(row)} | {clean_text(row.get('wallet') or '')} | success_24h={safe_float(row.get('success_rate_24h'), 0.0):.1%} | sample={safe_int(row.get('sample_24h'), 0)} | profile=https://polymarket.com/profile/{clean_text(row.get('wallet') or '')}"
+                f"{display_name(row)} | username={clean_text(row.get('username') or 'none')} | {clean_text(row.get('wallet') or '')} | success_24h={safe_float(row.get('success_rate_24h'), 0.0):.1%} | sample={safe_int(row.get('sample_24h'), 0)} | profile=https://polymarket.com/profile/{clean_text(row.get('wallet') or '')}"
             )
     return "\n".join(lines)
 
@@ -1128,16 +1168,39 @@ def health_text() -> str:
 # =========================================================
 # Scan engine
 # =========================================================
-def scan_once() -> Dict[str, Any]:
-    discovery_rows, discovery_stats = discover_candidate_wallets()
+def scan_once(manual_quick: bool = False) -> Dict[str, Any]:
+    started = utc_ts()
+    deadline_ts = started + MANUAL_SCAN_DEADLINE_SECONDS if manual_quick else None
+
+    if manual_quick:
+        discovery_rows, discovery_stats = discover_candidate_wallets(
+            leaderboard_limit=MANUAL_LEADERBOARD_LIMIT,
+            active_market_limit=MANUAL_ACTIVE_MARKET_LIMIT,
+            holders_per_market=MANUAL_HOLDERS_PER_MARKET,
+            max_candidate_wallets=MANUAL_MAX_CANDIDATE_WALLETS,
+        )
+    else:
+        discovery_rows, discovery_stats = discover_candidate_wallets()
+
     evaluated: List[Dict[str, Any]] = []
     errors = 0
+    time_budget_hit = False
 
-    for candidate in discovery_rows:
+    for idx, candidate in enumerate(discovery_rows):
+        if deadline_ts and utc_ts() >= deadline_ts:
+            time_budget_hit = True
+            break
         try:
             evaluated.append(evaluate_wallet(candidate))
         except Exception:
             errors += 1
+
+        if manual_quick:
+            passes = [x for x in evaluated if x.get("passes_filters")]
+            if len(evaluated) >= 12 and len(passes) >= min(6, TOP_WALLETS_PER_SCAN):
+                break
+            if len(evaluated) >= MANUAL_MAX_CANDIDATE_WALLETS:
+                break
 
     evaluated.sort(
         key=lambda x: (
@@ -1179,6 +1242,8 @@ def scan_once() -> Dict[str, Any]:
         "test_first": test_first,
         "watch_closely": watch_closely,
         "rejects": rejects,
+        "time_budget_hit": time_budget_hit,
+        "scan_runtime_seconds": round(utc_ts() - started, 2),
         "timestamp": iso_utc(now_utc()),
     }
     return stats
@@ -1292,8 +1357,8 @@ def maybe_send_group_summary(force: bool = False) -> Optional[str]:
     return text
 
 
-def run_scan_and_update(send_auto_telegram: bool = False) -> Dict[str, Any]:
-    result = scan_once()
+def run_scan_and_update(send_auto_telegram: bool = False, manual_quick: bool = False) -> Dict[str, Any]:
+    result = scan_once(manual_quick=manual_quick)
     update_runtime_after_scan(result)
     if send_auto_telegram:
         send_telegram(format_scan_text(result, manual=False))
@@ -1336,7 +1401,7 @@ def health_route():
 @app.route("/scan", methods=["GET"])
 def scan_route():
     ensure_background_started()
-    result = run_scan_and_update(send_auto_telegram=False)
+    result = run_scan_and_update(send_auto_telegram=False, manual_quick=True)
     return format_scan_text(result, manual=True), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
@@ -1366,13 +1431,26 @@ def webhook_route():
                 send_telegram("Manual scan already running")
                 return jsonify({"ok": True})
             manual_scan_in_progress = True
-        try:
-            send_telegram("Running wallet scan...")
-            result = run_scan_and_update(send_auto_telegram=False)
-            send_telegram(format_scan_text(result, manual=True))
-        finally:
-            with state_lock:
-                manual_scan_in_progress = False
+
+        def _manual_scan_worker() -> None:
+            global manual_scan_in_progress
+            try:
+                send_telegram("Running wallet scan...")
+                if MANUAL_SEND_CACHED_FIRST:
+                    try:
+                        cached = latest_cached_scan_text()
+                        send_telegram(cached)
+                    except Exception:
+                        pass
+                result = run_scan_and_update(send_auto_telegram=False, manual_quick=True)
+                send_telegram(format_scan_text(result, manual=True))
+            except Exception as exc:
+                send_telegram(f"Manual wallet scan error\nscript_version={SCRIPT_VERSION}\nerror={clean_text(exc)}")
+            finally:
+                with state_lock:
+                    manual_scan_in_progress = False
+
+        threading.Thread(target=_manual_scan_worker, daemon=True).start()
     else:
         send_telegram("Commands\n/health\n/scan\n/group")
     return jsonify({"ok": True})
@@ -1380,4 +1458,4 @@ def webhook_route():
 
 if __name__ == "__main__":
     ensure_background_started()
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", port=PORT
