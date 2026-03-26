@@ -1016,10 +1016,8 @@ def row_discovery_text(row: Dict[str, Any]) -> str:
 
 
 def format_wallet_row(row: Dict[str, Any]) -> List[str]:
-    wallet_full = clean_text(row.get('wallet', ''))
-    wallet_link = f"https://polymarket.com/profile/{wallet_full}" if wallet_full else ""
     lines = [
-        f"Wallet: {display_name(row)} ({wallet_full or short_wallet(wallet_full)})",
+        f"Wallet: {display_name(row)} ({short_wallet(row.get('wallet', ''))})",
         f"Bucket: {row.get('bucket', 'UNKNOWN')} | Score: {safe_float(row.get('score'), 0.0):.1f}",
         f"30d: pnl={safe_float(row.get('realized_pnl_30d'), 0.0):.2f} | weighted_ret={safe_float(row.get('weighted_return_30d'), 0.0):.1%} | avg_ret={safe_float(row.get('avg_return_30d'), 0.0):.1%}",
         f"30d sample: closed={safe_int(row.get('closed_positions_30d'), 0)} | trades={safe_int(row.get('trades_30d'), 0)} | wins={safe_float(row.get('win_rate_30d'), 0.0):.1%} | 20%+ closes={safe_float(row.get('consistency_ratio_30d'), 0.0):.1%}",
@@ -1032,8 +1030,6 @@ def format_wallet_row(row: Dict[str, Any]) -> List[str]:
         )
     lines.append(f"Why: {'; '.join(row.get('good_reasons') or ['none'])}")
     lines.append(f"Weakness: {'; '.join(row.get('weak_reasons') or ['none'])}")
-    if wallet_link:
-        lines.append(f"Profile: {wallet_link}")
     lines.append(row_discovery_text(row))
     return lines
 
@@ -1066,15 +1062,6 @@ def format_scan_text(result: Dict[str, Any], manual: bool = False) -> str:
     else:
         lines.append("None")
 
-    if not manual:
-        lines.append("Top rejects")
-        rejects = result.get("rejects") or []
-        if rejects:
-            for row in rejects[:5]:
-                lines.extend(format_wallet_row(row))
-                lines.append("")
-        else:
-            lines.append("None")
     return "\n".join(lines).strip()
 
 
@@ -1090,7 +1077,7 @@ def format_group_text(group_payload: Dict[str, Any]) -> str:
     if top:
         for row in top:
             lines.append(
-                f"{display_name(row)} ({clean_text(row.get('wallet', '')) or short_wallet(row.get('wallet', ''))}) | seen={safe_int(row.get('seen_count'), 0)} | best_score={safe_float(row.get('best_score'), 0.0):.1f} | best_bucket={row.get('best_bucket', 'UNKNOWN')} | profile=https://polymarket.com/profile/{clean_text(row.get('wallet', ''))}"
+                f"{display_name(row)} ({short_wallet(row.get('wallet', ''))}) | seen={safe_int(row.get('seen_count'), 0)} | best_score={safe_float(row.get('best_score'), 0.0):.1f} | best_bucket={row.get('best_bucket', 'UNKNOWN')}"
             )
     else:
         lines.append("None")
@@ -1100,7 +1087,7 @@ def format_group_text(group_payload: Dict[str, Any]) -> str:
     if observed:
         for row in observed:
             lines.append(
-                f"{display_name(row)} ({clean_text(row.get('wallet', '')) or short_wallet(row.get('wallet', ''))}) | 24h_success={safe_float(row.get('success_rate_24h'), 0.0):.1%} | sample={safe_int(row.get('sample_24h'), 0)} | avg_24h_move={safe_float(row.get('avg_move_24h'), 0.0):.1%} | profile=https://polymarket.com/profile/{clean_text(row.get('wallet', ''))}"
+                f"{display_name(row)} ({short_wallet(row.get('wallet', ''))}) | 24h_success={safe_float(row.get('success_rate_24h'), 0.0):.1%} | sample={safe_int(row.get('sample_24h'), 0)} | avg_24h_move={safe_float(row.get('avg_move_24h'), 0.0):.1%}"
             )
     else:
         lines.append("None")
@@ -1123,7 +1110,7 @@ def health_text() -> str:
         lines.append("Observed 24h leaders")
         for row in observed:
             lines.append(
-                f"{display_name(row)} ({clean_text(row.get('wallet', '')) or short_wallet(row.get('wallet', ''))}) | success_24h={safe_float(row.get('success_rate_24h'), 0.0):.1%} | sample={safe_int(row.get('sample_24h'), 0)} | profile=https://polymarket.com/profile/{clean_text(row.get('wallet', ''))}"
+                f"{display_name(row)} ({short_wallet(row.get('wallet', ''))}) | success_24h={safe_float(row.get('success_rate_24h'), 0.0):.1%} | sample={safe_int(row.get('sample_24h'), 0)}"
             )
     return "\n".join(lines)
 
