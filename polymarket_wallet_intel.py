@@ -839,6 +839,44 @@ def bucket_score(wallet_metrics: Dict[str, Any]) -> float:
     return round(clamp(score, 0.0, 100.0), 2)
 
 
+
+
+SPORTS_KEYWORDS = [
+    "sport", "sports", "nba", "wnba", "nfl", "mlb", "nhl", "ncaa", "ncaa basketball",
+    "ncaa football", "march madness", "final four", "super bowl", "world series",
+    "stanley cup", "premier league", "champions league", "uefa", "fifa", "world cup",
+    "soccer", "football", "basketball", "baseball", "hockey", "tennis", "golf",
+    "mma", "ufc", "boxing", "race", "racing", "nascar", "formula 1", "f1",
+    "cricket", "rugby", "olympics"
+]
+
+def row_text_blob(row: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    keys = [
+        "title", "question", "description", "slug", "category", "subcategory", "groupTitle",
+        "group", "eventTitle", "event", "market", "conditionId", "tokenName", "outcome",
+        "tag", "tags"
+    ]
+    for k in keys:
+        v = row.get(k)
+        if isinstance(v, str):
+            parts.append(v.lower())
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, str):
+                    parts.append(item.lower())
+                elif isinstance(item, dict):
+                    for dv in item.values():
+                        if isinstance(dv, str):
+                            parts.append(dv.lower())
+    return " | ".join(parts)
+
+def is_sports_row(row: Dict[str, Any]) -> bool:
+    blob = row_text_blob(row)
+    if not blob:
+        return False
+    return any(kw in blob for kw in SPORTS_KEYWORDS)
+
 def classify_bucket(wallet_metrics: Dict[str, Any]) -> str:
     score = wallet_metrics.get("score", 0.0)
     obs_sample_24h = safe_int(wallet_metrics.get("obs_sample_24h"), 0)
