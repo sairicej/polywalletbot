@@ -16,7 +16,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "wallet-intel-v5-nosports"
+SCRIPT_VERSION = "wallet-intel-v6-nosports-ratio"
 UTC = timezone.utc
 
 # =========================================================
@@ -41,6 +41,10 @@ ACTIVE_MARKET_LIMIT = int(os.getenv("ACTIVE_MARKET_LIMIT", "40"))
 HOLDERS_PER_MARKET = int(os.getenv("HOLDERS_PER_MARKET", "15"))
 MAX_CANDIDATE_WALLETS = int(os.getenv("MAX_CANDIDATE_WALLETS", "120"))
 EXCLUDE_SPORTS_WALLETS = os.getenv("EXCLUDE_SPORTS_WALLETS", "true").lower() == "true"
+SPORTS_RATIO_CLOSED_MAX = float(os.getenv("SPORTS_RATIO_CLOSED_MAX", "0.40"))
+SPORTS_RATIO_TRADES_MAX = float(os.getenv("SPORTS_RATIO_TRADES_MAX", "0.50"))
+SPORTS_RATIO_CURRENT_MAX = float(os.getenv("SPORTS_RATIO_CURRENT_MAX", "0.50"))
+SPORTS_RATIO_HOLDER_HINT_MAX = float(os.getenv("SPORTS_RATIO_HOLDER_HINT_MAX", "0.50"))
 TOP_WALLETS_PER_SCAN = int(os.getenv("TOP_WALLETS_PER_SCAN", "8"))
 TOP_WALLETS_PER_GROUP = int(os.getenv("TOP_WALLETS_PER_GROUP", "10"))
 
@@ -877,6 +881,12 @@ def is_sports_row(row: Dict[str, Any]) -> bool:
         return False
     return any(kw in blob for kw in SPORTS_KEYWORDS)
 
+def sports_ratio(sports_count: int, total_count: int) -> float:
+    total = safe_int(total_count, 0)
+    if total <= 0:
+        return 0.0
+    return safe_int(sports_count, 0) / float(total)
+
 def classify_bucket(wallet_metrics: Dict[str, Any]) -> str:
     score = wallet_metrics.get("score", 0.0)
     obs_sample_24h = safe_int(wallet_metrics.get("obs_sample_24h"), 0)
@@ -1052,6 +1062,17 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "obs_avg_move_24h": safe_float(obs.get("avg_move_24h"), 0.0),
         "observed_total": safe_int(obs.get("observed_total"), 0),
     }
+    holder_markets = candidate.get("holder_markets") or []
+    holder_sports_count = sum(
+        1 for m in holder_markets
+        if is_sports_text(clean_text(m.get("slug") or m.get("question") or m.get("title") or ""))
+    )
+
+    metrics["sports_ratio_closed_30d"] = sports_ratio(sports_rows_30d, len(closed_30d))
+    metrics["sports_ratio_trades_30d"] = sports_ratio(sports_trade_rows_30d, len(trade_30d))
+    metrics["sports_ratio_current_positions"] = sports_ratio(sports_current_positions, len(current_positions))
+    metrics["sports_ratio_holder_hints"] = sports_ratio(holder_sports_count, len(holder_markets))
+
     metrics["score"] = bucket_score(metrics)
     metrics["bucket"] = classify_bucket(metrics)
     metrics["good_reasons"], metrics["weak_reasons"] = reason_strings(metrics)
@@ -1059,12 +1080,31 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
     sports_ok = (
         not EXCLUDE_SPORTS_WALLETS
         or (
-            sports_rows_30d == 0
-            and sports_trade_rows_30d == 0
-            and sports_current_positions == 0
-            and not any(is_sports_text(clean_text(m.get("slug") or m.get("question") or "")) for m in (candidate.get("holder_markets") or []))
+            metrics["sports_ratio_closed_30d"] <= SPORTS_RATIO_CLOSED_MAX
+            and metrics["sports_ratio_trades_30d"] <= SPORTS_RATIO_TRADES_MAX
+            and metrics["sports_ratio_current_positions"] <= SPORTS_RATIO_CURRENT_MAX
+            and metrics["sports_ratio_holder_hints"] <= SPORTS_RATIO_HOLDER_HINT_MAX
         )
     )
+
+    if not sports_ok:
+        metrics["reject_reason"] = "sports_dominant"
+    elif metrics["closed_positions_30d"] < MIN_CLOSED_POSITIONS_30D:
+        metrics["reject_reason"] = "not_enough_closed_positions"
+    elif metrics["trades_30d"] < MIN_TRADES_30D:
+        metrics["reject_reason"] = "not_enough_trades"
+    elif metrics["weighted_return_30d"] < MIN_WEIGHTED_RETURN_30D:
+        metrics["reject_reason"] = "weighted_return_too_low"
+    elif metrics["win_rate_30d"] < MIN_WIN_RATE_30D:
+        metrics["reject_reason"] = "win_rate_too_low"
+    elif metrics["consistency_ratio_30d"] < MIN_CONSISTENCY_RATIO:
+        metrics["reject_reason"] = "consistency_too_low"
+    elif metrics["realized_pnl_30d"] < MIN_REALIZED_PNL_30D:
+        metrics["reject_reason"] = "realized_pnl_too_low"
+    elif metrics["recent_trades_7d"] < MIN_RECENT_TRADES_7D:
+        metrics["reject_reason"] = "recent_activity_too_low"
+    else:
+        metrics["reject_reason"] = ""
 
     passes = (
         metrics["closed_positions_30d"] >= MIN_CLOSED_POSITIONS_30D
@@ -1183,6 +1223,13 @@ def format_scan_text(result: Dict[str, Any], manual: bool = False) -> str:
             lines.append("")
     else:
         lines.append("None")
+
+    reject_counts = result.get("reject_reason_counts") or {}
+    if reject_counts:
+        lines.append("")
+        lines.append("Top reject reasons")
+        parts = [f"{k}:{v}" for k, v in sorted(reject_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+        lines.append(" | ".join(parts[:8]))
     return "\n".join(lines).strip()
 
 
@@ -1287,6 +1334,12 @@ def scan_once(manual_quick: bool = False) -> Dict[str, Any]:
     test_first = [x for x in evaluated if x.get("bucket") == "TEST FIRST" and x.get("passes_filters")][:TOP_WALLETS_PER_SCAN]
     watch_closely = [x for x in evaluated if x.get("bucket") == "WATCH CLOSELY" and x.get("passes_filters")][:TOP_WALLETS_PER_SCAN]
     rejects = [x for x in evaluated if not x.get("passes_filters")][:TOP_WALLETS_PER_SCAN]
+    reject_reason_counts: Dict[str, int] = {}
+    for row in evaluated:
+        if row.get("passes_filters"):
+            continue
+        reason = clean_text(row.get("reject_reason") or "other")
+        reject_reason_counts[reason] = reject_reason_counts.get(reason, 0) + 1
 
     observations_logged = 0
     for row in test_first + watch_closely:
@@ -1313,6 +1366,7 @@ def scan_once(manual_quick: bool = False) -> Dict[str, Any]:
         "test_first": test_first,
         "watch_closely": watch_closely,
         "rejects": rejects,
+        "reject_reason_counts": reject_reason_counts,
         "time_budget_hit": time_budget_hit,
         "scan_runtime_seconds": round(utc_ts() - started, 2),
         "timestamp": iso_utc(now_utc()),
