@@ -2192,3 +2192,318 @@ def format_scan_text(result: Dict[str, Any], manual: bool = False) -> str:
         lines.append(" | ".join(parts))
 
     return "\n".join(lines).strip()
+
+
+# =========================================================
+# v8.2 safe evaluator override
+# =========================================================
+SCRIPT_VERSION = "wallet-intel-v8.2-safe-eval"
+
+def _v82_endpoint_bucket(name: str) -> str:
+    return f"{clean_text(name).lower()}_error"
+
+def _v82_safe_fetch(fetcher, wallet: str, name: str):
+    try:
+        rows = fetcher(wallet)
+        if isinstance(rows, list):
+            return [x for x in rows if isinstance(x, dict)], None
+        if isinstance(rows, dict):
+            return [rows], None
+        return [], f"{name}_bad_shape"
+    except Exception as e:
+        return [], f"{name}_exception"
+
+def _v82_empty_metrics(candidate: Dict[str, Any], reason: str = "insufficient_data") -> Dict[str, Any]:
+    wallet = clean_text(candidate.get("wallet") or "")
+    username = clean_text(candidate.get("username") or "")
+    if wallet and not username:
+        try:
+            username = enrich_wallet_username(wallet, "")
+        except Exception:
+            username = ""
+    metrics: Dict[str, Any] = {
+        "wallet": wallet,
+        "username": username,
+        "sources": sorted(set(candidate.get("sources") or [])),
+        "leaderboard_rank": candidate.get("leaderboard_rank"),
+        "leaderboard_pnl": candidate.get("leaderboard_pnl", 0.0),
+        "leaderboard_vol": candidate.get("leaderboard_vol", 0.0),
+        "holder_markets": candidate.get("holder_markets") or [],
+        "closed_positions_30d": 0,
+        "trades_30d": 0,
+        "recent_trades_7d": 0,
+        "current_positions": 0,
+        "weighted_return_30d": 0.0,
+        "avg_return_30d": 0.0,
+        "median_return_30d": 0.0,
+        "realized_pnl_30d": 0.0,
+        "gross_cost_30d": 0.0,
+        "win_rate_30d": 0.0,
+        "consistency_ratio_30d": 0.0,
+        "intraday_roundtrips_30d": 0,
+        "losing_positions_30d": 0,
+        "sports_closed_positions_30d": 0,
+        "sports_trades_30d": 0,
+        "sports_current_positions": 0,
+        "sports_ratio_closed": 0.0,
+        "sports_ratio_trades": 0.0,
+        "sports_ratio_current": 0.0,
+        "sports_ratio_holder": 0.0,
+        "top_category_30d": dominant_category({}),
+        "top_categories_30d": [],
+        "obs_sample_1h": 0,
+        "obs_sample_6h": 0,
+        "obs_sample_24h": 0,
+        "obs_success_rate_1h": 0.0,
+        "obs_success_rate_6h": 0.0,
+        "obs_success_rate_24h": 0.0,
+        "obs_avg_move_24h": 0.0,
+        "observed_total": 0,
+        "observed_categories": [],
+        "endpoint_errors": [reason] if reason else [],
+    }
+    metrics["best_observation_window"] = best_observation_window(metrics)
+    metrics["timing_style"] = timing_style(metrics)
+    metrics["score"] = bucket_score(metrics)
+    metrics["bucket"] = classify_bucket(metrics)
+    metrics["good_reasons"] = []
+    metrics["weak_reasons"] = [reason] if reason else ["insufficient_data"]
+    metrics["passes_filters"] = False
+    return metrics
+
+def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    wallet = clean_text(candidate.get("wallet") or "")
+    if not wallet:
+        return _v82_empty_metrics(candidate, "missing_wallet")
+
+    cutoff_30d = days_ago(LOOKBACK_DAYS)
+    cutoff_7d = days_ago(RECENT_DAYS)
+
+    closed_positions, closed_err = _v82_safe_fetch(fetch_closed_positions, wallet, "closed_positions")
+    trades, trades_err = _v82_safe_fetch(fetch_trades, wallet, "trades")
+    current_positions, current_err = _v82_safe_fetch(fetch_current_positions, wallet, "current_positions")
+
+    endpoint_errors = [x for x in [closed_err, trades_err, current_err] if x]
+
+    sports_rows_30d = 0
+    sports_trade_rows_30d = 0
+    sports_current_positions = 0
+    closed_category_counts: Dict[str, int] = defaultdict(int)
+    trade_category_counts: Dict[str, int] = defaultdict(int)
+    current_category_counts: Dict[str, int] = defaultdict(int)
+    holder_category_counts: Dict[str, int] = defaultdict(int)
+
+    closed_30d: List[Dict[str, Any]] = []
+    trade_30d: List[Dict[str, Any]] = []
+    recent_trades_7d = 0
+
+    try:
+        for row in closed_positions:
+            ts = parse_ts(row.get("timestamp") or row.get("time") or row.get("updatedAt") or row.get("closedAt"))
+            if ts is None or ts < cutoff_30d:
+                continue
+            closed_30d.append(row)
+            closed_category_counts[categorize_row(row)] += 1
+            if EXCLUDE_SPORTS_WALLETS and is_sports_row(row):
+                sports_rows_30d += 1
+    except Exception:
+        endpoint_errors.append("closed_positions_parse_error")
+        closed_30d = []
+
+    try:
+        for row in trades:
+            ts = parse_ts(row.get("timestamp") or row.get("time") or row.get("createdAt") or row.get("updatedAt"))
+            if ts is None:
+                continue
+            if ts >= cutoff_30d:
+                trade_30d.append(row)
+                trade_category_counts[categorize_row(row)] += 1
+                if EXCLUDE_SPORTS_WALLETS and is_sports_row(row):
+                    sports_trade_rows_30d += 1
+            if ts >= cutoff_7d:
+                recent_trades_7d += 1
+    except Exception:
+        endpoint_errors.append("trades_parse_error")
+        trade_30d = []
+        recent_trades_7d = 0
+
+    try:
+        for row in current_positions:
+            current_category_counts[categorize_row(row)] += 1
+            if EXCLUDE_SPORTS_WALLETS and is_sports_row(row):
+                sports_current_positions += 1
+    except Exception:
+        endpoint_errors.append("current_positions_parse_error")
+        current_positions = []
+
+    weighted_pnl = 0.0
+    weighted_cost = 0.0
+    positive_positions = 0
+    consistency_hits = 0
+    losing_positions = 0
+    returns: List[float] = []
+
+    try:
+        for row in closed_30d:
+            realized_pnl = safe_float(row.get("realizedPnl") or row.get("pnl"), 0.0)
+            basis = safe_float(
+                row.get("initialValue")
+                or row.get("amount")
+                or row.get("size")
+                or row.get("totalAmount")
+                or row.get("cost")
+                or row.get("avgPrice")
+                or 0.0,
+                0.0,
+            )
+            if basis <= 0:
+                price = safe_float(row.get("price") or row.get("avgPrice"), 0.0)
+                qty = safe_float(row.get("shares") or row.get("size") or row.get("amount"), 0.0)
+                basis = max(price * qty, 0.0)
+            ret = (realized_pnl / basis) if basis > 0 else 0.0
+            returns.append(ret)
+            weighted_pnl += realized_pnl
+            weighted_cost += max(basis, 0.0)
+            if realized_pnl > 0:
+                positive_positions += 1
+            elif realized_pnl < 0:
+                losing_positions += 1
+            if ret >= 0.20:
+                consistency_hits += 1
+    except Exception:
+        endpoint_errors.append("closed_positions_calc_error")
+        weighted_pnl = 0.0
+        weighted_cost = 0.0
+        positive_positions = 0
+        consistency_hits = 0
+        losing_positions = 0
+        returns = []
+
+    weighted_return = (weighted_pnl / weighted_cost) if weighted_cost > 0 else 0.0
+    win_rate = (positive_positions / len(closed_30d)) if closed_30d else 0.0
+    consistency_ratio = (consistency_hits / len(closed_30d)) if closed_30d else 0.0
+    avg_return = (sum(returns) / len(returns)) if returns else 0.0
+    median_return = sorted(returns)[len(returns) // 2] if returns else 0.0
+
+    intraday_roundtrips = 0
+    try:
+        by_slug_day: Dict[Tuple[str, str], Dict[str, int]] = defaultdict(lambda: {"BUY": 0, "SELL": 0})
+        for row in trade_30d:
+            ts = parse_ts(row.get("timestamp") or row.get("time") or row.get("createdAt") or row.get("updatedAt"))
+            if ts is None:
+                continue
+            slug = clean_text(row.get("slug") or row.get("marketSlug") or row.get("title") or row.get("conditionId"))
+            key = (slug, ts.strftime("%Y-%m-%d"))
+            side = normalize_side(row.get("side") or row.get("type") or row.get("action") or "")
+            if side not in ("BUY", "SELL"):
+                continue
+            by_slug_day[key][side] += 1
+        intraday_roundtrips = sum(1 for v in by_slug_day.values() if v["BUY"] > 0 and v["SELL"] > 0)
+    except Exception:
+        endpoint_errors.append("trades_intraday_error")
+        intraday_roundtrips = 0
+
+    try:
+        for m in (candidate.get("holder_markets") or []):
+            if isinstance(m, dict):
+                holder_category_counts[categorize_text(clean_text(m.get("slug") or m.get("question") or ""))] += 1
+    except Exception:
+        endpoint_errors.append("holder_hint_parse_error")
+
+    top_category = dominant_category(dict(closed_category_counts or trade_category_counts or current_category_counts or holder_category_counts))
+    sports_ratio_closed = safe_ratio(sports_rows_30d, len(closed_30d))
+    sports_ratio_trades = safe_ratio(sports_trade_rows_30d, len(trade_30d))
+    sports_ratio_current = safe_ratio(sports_current_positions, len(current_positions))
+    holder_sports = holder_category_counts.get("sports", 0)
+    sports_ratio_holder = safe_ratio(holder_sports, sum(holder_category_counts.values()))
+
+    try:
+        obs = fetch_observation_stats(wallet)
+    except Exception:
+        obs = {}
+        endpoint_errors.append("observation_stats_error")
+
+    username = clean_text(candidate.get("username") or "")
+    if not username:
+        try:
+            username = enrich_wallet_username(wallet, "")
+        except Exception:
+            endpoint_errors.append("profile_enrichment_error")
+            username = ""
+
+    metrics: Dict[str, Any] = {
+        "wallet": wallet,
+        "username": username,
+        "sources": sorted(set(candidate.get("sources") or [])),
+        "leaderboard_rank": candidate.get("leaderboard_rank"),
+        "leaderboard_pnl": candidate.get("leaderboard_pnl", 0.0),
+        "leaderboard_vol": candidate.get("leaderboard_vol", 0.0),
+        "holder_markets": candidate.get("holder_markets") or [],
+        "closed_positions_30d": len(closed_30d),
+        "trades_30d": len(trade_30d),
+        "recent_trades_7d": recent_trades_7d,
+        "current_positions": len(current_positions),
+        "weighted_return_30d": weighted_return,
+        "avg_return_30d": avg_return,
+        "median_return_30d": median_return,
+        "realized_pnl_30d": weighted_pnl,
+        "gross_cost_30d": weighted_cost,
+        "win_rate_30d": win_rate,
+        "consistency_ratio_30d": consistency_ratio,
+        "intraday_roundtrips_30d": intraday_roundtrips,
+        "losing_positions_30d": losing_positions,
+        "sports_closed_positions_30d": sports_rows_30d,
+        "sports_trades_30d": sports_trade_rows_30d,
+        "sports_current_positions": sports_current_positions,
+        "sports_ratio_closed": sports_ratio_closed,
+        "sports_ratio_trades": sports_ratio_trades,
+        "sports_ratio_current": sports_ratio_current,
+        "sports_ratio_holder": sports_ratio_holder,
+        "top_category_30d": top_category,
+        "top_categories_30d": top_categories(dict(closed_category_counts or trade_category_counts or current_category_counts or holder_category_counts)),
+        "obs_sample_1h": safe_int(obs.get("sample_1h"), 0),
+        "obs_sample_6h": safe_int(obs.get("sample_6h"), 0),
+        "obs_sample_24h": safe_int(obs.get("sample_24h"), 0),
+        "obs_success_rate_1h": safe_float(obs.get("success_rate_1h"), 0.0),
+        "obs_success_rate_6h": safe_float(obs.get("success_rate_6h"), 0.0),
+        "obs_success_rate_24h": safe_float(obs.get("success_rate_24h"), 0.0),
+        "obs_avg_move_24h": safe_float(obs.get("avg_move_24h"), 0.0),
+        "observed_total": safe_int(obs.get("observed_total"), 0),
+        "observed_categories": obs.get("observed_categories") or [],
+        "endpoint_errors": endpoint_errors,
+    }
+
+    metrics["best_observation_window"] = best_observation_window(metrics)
+    metrics["timing_style"] = timing_style(metrics)
+    metrics["score"] = bucket_score(metrics)
+    metrics["bucket"] = classify_bucket(metrics)
+    metrics["good_reasons"], metrics["weak_reasons"] = reason_strings(metrics)
+
+    if endpoint_errors:
+        metrics["weak_reasons"] = list(metrics.get("weak_reasons") or []) + endpoint_errors[:2]
+
+    sports_ok = (
+        not EXCLUDE_SPORTS_WALLETS
+        or (
+            sports_ratio_closed <= SPORTS_RATIO_CLOSED_MAX
+            and sports_ratio_trades <= SPORTS_RATIO_TRADES_MAX
+            and sports_ratio_current <= SPORTS_RATIO_CURRENT_MAX
+            and sports_ratio_holder <= SPORTS_RATIO_HOLDER_HINT_MAX
+        )
+    )
+
+    metrics["passes_filters"] = (
+        metrics["closed_positions_30d"] >= MIN_CLOSED_POSITIONS_30D
+        and metrics["trades_30d"] >= MIN_TRADES_30D
+        and metrics["weighted_return_30d"] >= MIN_WEIGHTED_RETURN_30D
+        and metrics["win_rate_30d"] >= MIN_WIN_RATE_30D
+        and metrics["consistency_ratio_30d"] >= MIN_CONSISTENCY_RATIO
+        and metrics["realized_pnl_30d"] >= MIN_REALIZED_PNL_30D
+        and metrics["recent_trades_7d"] >= MIN_RECENT_TRADES_7D
+        and sports_ok
+    )
+
+    if not metrics["passes_filters"] and not metrics["weak_reasons"]:
+        metrics["weak_reasons"] = ["insufficient_data"]
+
+    return metrics
