@@ -16,7 +16,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "wallet-intel-v7-patterns"
+SCRIPT_VERSION = "wallet-intel-v8-pattern-timing-clusters"
 UTC = timezone.utc
 
 # =========================================================
@@ -514,6 +514,27 @@ def safe_ratio(num: float, den: float) -> float:
         return 0.0
     return num / den
 
+
+
+def category_trend_summary(metrics: Dict[str, Any]) -> str:
+    cat = clean_text(metrics.get("top_category_30d") or "other")
+    wr = safe_float(metrics.get("top_category_win_rate_30d"), 0.0)
+    avg_ret = safe_float(metrics.get("top_category_avg_return_30d"), 0.0)
+    sample = safe_int(metrics.get("top_category_closed_count_30d"), 0)
+    return f"{cat} wr={wr:.1%} avg={avg_ret:.1%} n={sample}"
+
+
+def hour_bucket_label(hour_val: Any) -> str:
+    h = safe_int(hour_val, -1)
+    if h < 0 or h > 23:
+        return "unknown"
+    return f"{h:02d}:00Z"
+
+
+def cluster_label(metrics: Dict[str, Any]) -> str:
+    cat = clean_text(metrics.get("top_category_30d") or "other")
+    timing = clean_text(metrics.get("timing_style") or "unproven")
+    return f"{cat}:{timing}"
 def best_observation_window(metrics: Dict[str, Any]) -> str:
     options = {
         "1h": safe_float(metrics.get("obs_success_rate_1h"), 0.0),
@@ -542,6 +563,8 @@ def similarity_distance(a: Dict[str, Any], b: Dict[str, Any]) -> float:
         abs(safe_float(a.get("consistency_ratio_30d"), 0.0) - safe_float(b.get("consistency_ratio_30d"), 0.0)) * 40.0,
         abs(safe_float(a.get("obs_success_rate_24h"), 0.0) - safe_float(b.get("obs_success_rate_24h"), 0.0)) * 50.0,
         abs(safe_float(a.get("recent_trades_7d"), 0.0) - safe_float(b.get("recent_trades_7d"), 0.0)) / 5.0,
+        abs(safe_float(a.get("top_category_win_rate_30d"), 0.0) - safe_float(b.get("top_category_win_rate_30d"), 0.0)) * 35.0,
+        abs(safe_int(a.get("dominant_entry_hour_utc"), -1) - safe_int(b.get("dominant_entry_hour_utc"), -1)) / 3.0,
     ]
     score = sum(vals)
     if clean_text(a.get("top_category_30d")) != clean_text(b.get("top_category_30d")):
@@ -570,6 +593,7 @@ def annotate_similar_wallets(rows: List[Dict[str, Any]]) -> None:
                 "score": other.get("score", 0.0),
                 "top_category_30d": other.get("top_category_30d", ""),
                 "timing_style": other.get("timing_style", ""),
+                "cluster_label": other.get("cluster_label", ""),
             })
         row["similar_wallets"] = similar
 
@@ -577,13 +601,16 @@ def pattern_summary_line(row: Dict[str, Any]) -> str:
     cat = clean_text(row.get("top_category_30d") or "other")
     timing = clean_text(row.get("timing_style") or "unproven")
     best_window = clean_text(row.get("best_observation_window") or "none")
-    parts = [f"category={cat}", f"timing={timing}", f"best_window={best_window}"]
+    hour_txt = hour_bucket_label(row.get("dominant_entry_hour_utc"))
+    cat_wr = safe_float(row.get("top_category_win_rate_30d"), 0.0)
+    parts = [f"category={cat}", f"cat_wr={cat_wr:.1%}", f"entry_hour={hour_txt}", f"timing={timing}", f"best_window={best_window}"]
     obs24 = safe_int(row.get("obs_sample_24h"), 0)
     if obs24 > 0:
         parts.append(f"obs24={safe_float(row.get('obs_success_rate_24h'), 0.0):.1%}")
     obs1 = safe_int(row.get("obs_sample_1h"), 0)
     if obs1 > 0:
         parts.append(f"obs1={safe_float(row.get('obs_success_rate_1h'), 0.0):.1%}")
+    parts.append(f"cluster={clean_text(row.get('cluster_label') or 'none')}")
     return "Pattern: " + " | ".join(parts)
 
 
@@ -1201,6 +1228,11 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "sports_ratio_holder": sports_ratio_holder,
         "top_category_30d": top_category,
         "top_categories_30d": top_categories(dict(closed_category_counts or trade_category_counts or current_category_counts or holder_category_counts)),
+        "top_category_closed_count_30d": top_cat_count,
+        "top_category_win_rate_30d": top_category_win_rate,
+        "top_category_avg_return_30d": top_category_avg_return,
+        "dominant_entry_hour_utc": dominant_entry_hour,
+        "active_entry_hours_utc": active_entry_hours,
         "obs_sample_1h": safe_int(obs.get("sample_1h"), 0),
         "obs_sample_6h": safe_int(obs.get("sample_6h"), 0),
         "obs_sample_24h": safe_int(obs.get("sample_24h"), 0),
@@ -1213,6 +1245,7 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
     }
     metrics["best_observation_window"] = best_observation_window(metrics)
     metrics["timing_style"] = timing_style(metrics)
+    metrics["cluster_label"] = cluster_label(metrics)
     metrics["score"] = bucket_score(metrics)
     metrics["bucket"] = classify_bucket(metrics)
     metrics["good_reasons"], metrics["weak_reasons"] = reason_strings(metrics)
@@ -1273,6 +1306,7 @@ def format_wallet_row(row: Dict[str, Any]) -> List[str]:
         f"30d: pnl={safe_float(row.get('realized_pnl_30d'), 0.0):.2f} | weighted_ret={safe_float(row.get('weighted_return_30d'), 0.0):.1%} | avg_ret={safe_float(row.get('avg_return_30d'), 0.0):.1%}",
         f"30d sample: closed={safe_int(row.get('closed_positions_30d'), 0)} | trades={safe_int(row.get('trades_30d'), 0)} | wins={safe_float(row.get('win_rate_30d'), 0.0):.1%} | 20%+ closes={safe_float(row.get('consistency_ratio_30d'), 0.0):.1%}",
         f"Recent: trades_7d={safe_int(row.get('recent_trades_7d'), 0)} | intraday_signals={safe_int(row.get('intraday_roundtrips_30d'), 0)} | current_positions={safe_int(row.get('current_positions'), 0)}",
+        f"Closed-trade trend: {category_trend_summary(row)} | dominant_entry_hour={hour_bucket_label(row.get('dominant_entry_hour_utc'))}",
     ]
     obs_sample_24h = safe_int(row.get("obs_sample_24h"), 0)
     if obs_sample_24h > 0:
@@ -1282,7 +1316,7 @@ def format_wallet_row(row: Dict[str, Any]) -> List[str]:
     lines.append(pattern_summary_line(row))
     similar = row.get("similar_wallets") or []
     if similar:
-        lines.append("Similar: " + " | ".join([f"{clean_text(x.get('username') or x.get('wallet') or '')} ({clean_text(x.get('top_category_30d') or 'other')}, {clean_text(x.get('timing_style') or 'unproven')})" for x in similar]))
+        lines.append("Similar: " + " | ".join([f"{clean_text(x.get('username') or x.get('wallet') or '')} ({clean_text(x.get('cluster_label') or ((x.get('top_category_30d') or 'other') + ':' + (x.get('timing_style') or 'unproven')) )})" for x in similar]))
     lines.append(f"Why: {'; '.join(row.get('good_reasons') or ['none'])}")
     lines.append(f"Weakness: {'; '.join(row.get('weak_reasons') or ['none'])}")
     lines.append(row_discovery_text(row))
