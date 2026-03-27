@@ -16,7 +16,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "wallet-intel-v8.3-scoring-timing"
+SCRIPT_VERSION = "wallet-intel-v8.3.1-stable-patch"
 UTC = timezone.utc
 
 # =========================================================
@@ -224,6 +224,7 @@ def load_state() -> None:
     runtime_state.setdefault("scan_history", [])
     runtime_state.setdefault("session_summary", {})
     runtime_state.setdefault("last_health", {})
+    runtime_state.setdefault("last_nonempty_scan", {})
 
 
 def save_state() -> None:
@@ -232,6 +233,7 @@ def save_state() -> None:
         "scan_history": runtime_state.get("scan_history", [])[-36:],
         "session_summary": runtime_state.get("session_summary", {}),
         "last_health": runtime_state.get("last_health", {}),
+        "last_nonempty_scan": runtime_state.get("last_nonempty_scan", {}),
     }
     json_dump(STATE_FILE, payload)
 
@@ -268,6 +270,41 @@ def send_telegram(text: str) -> None:
         )
     except Exception:
         pass
+
+
+def cached_candidate_rows(limit: int) -> List[Dict[str, Any]]:
+    with state_lock:
+        history = runtime_state.get("scan_history", []) or []
+    if not history:
+        return []
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for item in reversed(history[-12:]):
+        for row in item.get("top_wallets", []) or []:
+            wallet = clean_text(row.get("wallet") or "")
+            if not wallet or wallet in seen:
+                continue
+            seen.add(wallet)
+            out.append({
+                "wallet": wallet,
+                "sources": ["cache_fallback"],
+                "leaderboard_rank": row.get("leaderboard_rank"),
+                "leaderboard_pnl": safe_float(row.get("leaderboard_pnl"), 0.0),
+                "leaderboard_vol": safe_float(row.get("leaderboard_vol"), 0.0),
+                "username": clean_text(row.get("username") or ""),
+                "holder_markets": row.get("holder_markets") or [],
+            })
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def last_nonempty_scan_text() -> str:
+    with state_lock:
+        payload = runtime_state.get("last_nonempty_scan") or {}
+    if not payload:
+        return ""
+    return format_scan_text(payload, manual=True)
 
 
 # =========================================================
@@ -328,10 +365,14 @@ def init_db() -> None:
 # Public Polymarket fetchers
 # =========================================================
 def fetch_leaderboard_wallets(limit: int) -> List[Dict[str, Any]]:
-    rows = fetch_list(
-        f"{DATA_API_V1_BASE}/leaderboard",
-        params={"limit": min(limit, 100), "timePeriod": "MONTH", "orderBy": "PNL", "category": "OVERALL"},
-    )
+    params = {"limit": min(limit, 100), "timePeriod": "MONTH", "orderBy": "PNL", "category": "OVERALL"}
+    rows = fetch_list(f"{DATA_API_V1_BASE}/leaderboard", params=params)
+    if not rows:
+        time.sleep(0.35)
+        rows = fetch_list(f"{DATA_API_V1_BASE}/leaderboard", params=params)
+    if not rows:
+        alt = {"limit": min(limit, 100), "timePeriod": "MONTH"}
+        rows = fetch_list(f"{DATA_API_V1_BASE}/leaderboard", params=alt)
     out: List[Dict[str, Any]] = []
     for row in rows:
         wallet = str(row.get("proxyWallet") or row.get("wallet") or row.get("user") or row.get("address") or "").strip()
@@ -597,6 +638,8 @@ def discover_candidate_wallets(leaderboard_limit: Optional[int] = None, active_m
         "active_markets": 0,
         "holder_wallets": 0,
         "unique_candidate_wallets": 0,
+        "discovery_fallback_used": False,
+        "discovery_issue": "",
     }
 
     leaderboard_limit = leaderboard_limit or LEADERBOARD_LIMIT
@@ -604,7 +647,18 @@ def discover_candidate_wallets(leaderboard_limit: Optional[int] = None, active_m
     holders_per_market = holders_per_market or HOLDERS_PER_MARKET
     max_candidate_wallets = max_candidate_wallets or MAX_CANDIDATE_WALLETS
 
-    for row in fetch_leaderboard_wallets(leaderboard_limit):
+    leaderboard_rows = fetch_leaderboard_wallets(leaderboard_limit)
+    if not leaderboard_rows:
+        stats["discovery_issue"] = "leaderboard_empty"
+        fallback_rows = cached_candidate_rows(max_candidate_wallets)
+        if fallback_rows:
+            stats["discovery_fallback_used"] = True
+            stats["leaderboard_wallets"] = len(fallback_rows)
+            stats["unique_candidate_wallets"] = len(fallback_rows)
+            return fallback_rows[:max_candidate_wallets], stats
+        return [], stats
+
+    for row in leaderboard_rows:
         wallet = row["wallet"]
         base = candidates.setdefault(
             wallet,
@@ -668,6 +722,13 @@ def discover_candidate_wallets(leaderboard_limit: Optional[int] = None, active_m
         )
     )
     stats["unique_candidate_wallets"] = len(deduped)
+    if not deduped:
+        stats["discovery_issue"] = stats.get("discovery_issue") or "candidate_empty"
+        fallback_rows = cached_candidate_rows(max_candidate_wallets)
+        if fallback_rows:
+            stats["discovery_fallback_used"] = True
+            stats["unique_candidate_wallets"] = len(fallback_rows)
+            return fallback_rows[:max_candidate_wallets], stats
     return deduped[:max_candidate_wallets], stats
 
 
@@ -1325,6 +1386,7 @@ def format_scan_text(result: Dict[str, Any], manual: bool = False) -> str:
         f"leaderboard_wallets={result.get('leaderboard_wallets', 0)} | active_markets={result.get('active_markets', 0)} | holder_wallets={result.get('holder_wallets', 0)} | unique_candidates={result.get('unique_candidate_wallets', 0)}",
         f"observations_logged={result.get('observations_logged', 0)} | obs_eval_1h={result.get('obs_eval_1h', 0)} | obs_eval_6h={result.get('obs_eval_6h', 0)} | obs_eval_24h={result.get('obs_eval_24h', 0)}",
         f"scan_runtime_seconds={safe_float(result.get('scan_runtime_seconds'), 0.0):.2f} | time_budget_hit={str(bool(result.get('time_budget_hit', False))).lower()}",
+        f"live_discovery_count={safe_int(result.get('live_discovery_count'), 0)} | discovery_fallback_used={str(bool(result.get('discovery_fallback_used', False))).lower()} | discovery_issue={clean_text(result.get('discovery_issue') or 'none')}",
         "",
         "Wallets to test first",
     ]
@@ -1394,6 +1456,7 @@ def health_text() -> str:
         f"scans={safe_int(session.get('scans'), 0)} | wallets_evaluated={safe_int(session.get('wallets_evaluated'), 0)} | wallets_passing={safe_int(session.get('wallets_passing'), 0)}",
         f"observations_logged={safe_int(session.get('observations_logged'), 0)} | observations_evaluated={safe_int(session.get('observations_evaluated'), 0)}",
         f"last_group_top_count={safe_int(session.get('last_group_top_count'), 0)} | observed_wallets={len(observed)}",
+        f"discovery_fallback_used={str(bool(session.get('discovery_fallback_used', 0))).lower()} | discovery_issue={clean_text(session.get('discovery_issue') or 'none')}",
     ]
     if observed:
         lines.append("Observed 24h leaders")
@@ -1458,6 +1521,26 @@ def scan_once(manual_quick: bool = False) -> Dict[str, Any]:
     watch_closely = [x for x in evaluated if x.get("bucket") == "WATCH CLOSELY" and x.get("passes_filters")][:TOP_WALLETS_PER_SCAN]
     rejects = [x for x in evaluated if not x.get("passes_filters")][:TOP_WALLETS_PER_SCAN]
 
+    # Discovery/evaluation fallback: if live scan produced nothing usable, preserve last non-empty result
+    fallback_used = False
+    fallback_reason = ""
+    if not discovery_rows or (len(evaluated) == 0 and errors == 0):
+        with state_lock:
+            prev = runtime_state.get("last_nonempty_scan") or {}
+        prev_eval = prev.get("evaluated") or []
+        if prev_eval:
+            fallback_used = True
+            fallback_reason = discovery_stats.get("discovery_issue") or "empty_live_scan"
+            evaluated = prev_eval
+            test_first = prev.get("test_first") or []
+            watch_closely = prev.get("watch_closely") or []
+            rejects = prev.get("rejects") or []
+            discovery_stats["discovery_fallback_used"] = True
+            discovery_stats["discovery_issue"] = fallback_reason
+            if not discovery_rows:
+                discovery_stats["leaderboard_wallets"] = max(safe_int(discovery_stats.get("leaderboard_wallets"), 0), safe_int(prev.get("leaderboard_wallets"), 0))
+                discovery_stats["unique_candidate_wallets"] = max(safe_int(discovery_stats.get("unique_candidate_wallets"), 0), safe_int(prev.get("unique_candidate_wallets"), 0))
+
     observations_logged = 0
     for row in test_first + watch_closely:
         try:
@@ -1486,45 +1569,69 @@ def scan_once(manual_quick: bool = False) -> Dict[str, Any]:
         "time_budget_hit": time_budget_hit,
         "scan_runtime_seconds": round(utc_ts() - started, 2),
         "timestamp": iso_utc(now_utc()),
+        "live_discovery_count": len(discovery_rows),
+        "fallback_scan_used": fallback_used,
+        "fallback_reason": fallback_reason,
     }
     return stats
 
 
 def update_runtime_after_scan(result: Dict[str, Any]) -> None:
+    top_wallet_rows = (
+        (result.get("test_first") or [])
+        + (result.get("watch_closely") or [])
+        + ([x for x in (result.get("evaluated") or []) if x.get("passes_filters")][:TOP_WALLETS_PER_SCAN] if not ((result.get("test_first") or []) or (result.get("watch_closely") or [])) else [])
+    )
+    top_wallet_payload = [
+        {
+            "wallet": row.get("wallet"),
+            "username": row.get("username"),
+            "score": row.get("score"),
+            "bucket": row.get("bucket"),
+            "top_category_30d": row.get("top_category_30d"),
+            "timing_style": row.get("timing_style"),
+            "leaderboard_rank": row.get("leaderboard_rank"),
+            "leaderboard_pnl": row.get("leaderboard_pnl"),
+            "leaderboard_vol": row.get("leaderboard_vol"),
+            "holder_markets": row.get("holder_markets") or [],
+        }
+        for row in top_wallet_rows
+    ]
+
     with state_lock:
-        runtime_state["scan_history"].append(
-            {
+        if top_wallet_payload:
+            runtime_state["scan_history"].append(
+                {
+                    "timestamp": result.get("timestamp"),
+                    "top_wallets": top_wallet_payload,
+                }
+            )
+            runtime_state["scan_history"] = runtime_state["scan_history"][-36:]
+            runtime_state["last_nonempty_scan"] = {
                 "timestamp": result.get("timestamp"),
-                "top_wallets": [
-                    {
-                        "wallet": row.get("wallet"),
-                        "username": row.get("username"),
-                        "score": row.get("score"),
-                        "bucket": row.get("bucket"),
-                        "top_category_30d": row.get("top_category_30d"),
-                        "timing_style": row.get("timing_style"),
-                    }
-                    for row in (
-                        (result.get("test_first") or [])
-                        + (result.get("watch_closely") or [])
-                        + ([x for x in (result.get("evaluated") or []) if x.get("passes_filters")][:TOP_WALLETS_PER_SCAN] if not ((result.get("test_first") or []) or (result.get("watch_closely") or [])) else [])
-                    )
-                ],
+                "leaderboard_wallets": result.get("leaderboard_wallets", 0),
+                "unique_candidate_wallets": result.get("unique_candidate_wallets", 0),
+                "evaluated": result.get("evaluated") or [],
+                "test_first": result.get("test_first") or [],
+                "watch_closely": result.get("watch_closely") or [],
+                "rejects": result.get("rejects") or [],
             }
-        )
-        runtime_state["scan_history"] = runtime_state["scan_history"][-36:]
         session = runtime_state.setdefault("session_summary", {})
         session["scans"] = safe_int(session.get("scans"), 0) + 1
         session["wallets_evaluated"] = safe_int(session.get("wallets_evaluated"), 0) + safe_int(result.get("evaluated_wallets"), 0)
         session["wallets_passing"] = safe_int(session.get("wallets_passing"), 0) + safe_int(result.get("passing_wallets"), 0)
-        session["last_scan_top_count"] = len((result.get("test_first") or []) + (result.get("watch_closely") or []))
+        session["last_scan_top_count"] = len(top_wallet_payload)
         session["observations_logged"] = safe_int(session.get("observations_logged"), 0) + safe_int(result.get("observations_logged"), 0)
         session["observations_evaluated"] = safe_int(session.get("observations_evaluated"), 0) + safe_int(result.get("obs_eval_1h"), 0) + safe_int(result.get("obs_eval_6h"), 0) + safe_int(result.get("obs_eval_24h"), 0)
         session["last_observed_success_wallets"] = len(top_observed_wallets(limit=10))
+        session["discovery_fallback_used"] = 1 if result.get("discovery_fallback_used") else 0
+        session["discovery_issue"] = clean_text(result.get("discovery_issue") or "")
         runtime_state["last_health"] = {
             "last_scan_at": result.get("timestamp"),
             "last_scan_evaluated": result.get("evaluated_wallets", 0),
             "last_scan_passing": result.get("passing_wallets", 0),
+            "live_discovery_count": result.get("live_discovery_count", 0),
+            "fallback_scan_used": bool(result.get("fallback_scan_used")),
         }
         save_state()
 
