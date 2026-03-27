@@ -16,7 +16,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "wallet-intel-v6-nosports-ratio"
+SCRIPT_VERSION = "wallet-intel-v7-patterns"
 UTC = timezone.utc
 
 # =========================================================
@@ -41,12 +41,14 @@ ACTIVE_MARKET_LIMIT = int(os.getenv("ACTIVE_MARKET_LIMIT", "40"))
 HOLDERS_PER_MARKET = int(os.getenv("HOLDERS_PER_MARKET", "15"))
 MAX_CANDIDATE_WALLETS = int(os.getenv("MAX_CANDIDATE_WALLETS", "120"))
 EXCLUDE_SPORTS_WALLETS = os.getenv("EXCLUDE_SPORTS_WALLETS", "true").lower() == "true"
+TOP_WALLETS_PER_SCAN = int(os.getenv("TOP_WALLETS_PER_SCAN", "8"))
+TOP_WALLETS_PER_GROUP = int(os.getenv("TOP_WALLETS_PER_GROUP", "10"))
+
 SPORTS_RATIO_CLOSED_MAX = float(os.getenv("SPORTS_RATIO_CLOSED_MAX", "0.40"))
 SPORTS_RATIO_TRADES_MAX = float(os.getenv("SPORTS_RATIO_TRADES_MAX", "0.50"))
 SPORTS_RATIO_CURRENT_MAX = float(os.getenv("SPORTS_RATIO_CURRENT_MAX", "0.50"))
 SPORTS_RATIO_HOLDER_HINT_MAX = float(os.getenv("SPORTS_RATIO_HOLDER_HINT_MAX", "0.50"))
-TOP_WALLETS_PER_SCAN = int(os.getenv("TOP_WALLETS_PER_SCAN", "8"))
-TOP_WALLETS_PER_GROUP = int(os.getenv("TOP_WALLETS_PER_GROUP", "10"))
+SIMILAR_WALLETS_LIMIT = int(os.getenv("SIMILAR_WALLETS_LIMIT", "3"))
 
 # Manual quick scan limits
 MANUAL_LEADERBOARD_LIMIT = int(os.getenv("MANUAL_LEADERBOARD_LIMIT", "25"))
@@ -314,6 +316,7 @@ def init_db() -> None:
             )
             """
         )
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_observed_wallet_status ON observed_trades(wallet, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_observed_trade_time ON observed_trades(trade_time)")
         conn.commit()
@@ -438,6 +441,150 @@ def fetch_market_snapshot(slug: str = "", condition_id: str = "") -> Optional[Di
         "yes_price": safe_float(row.get("yesPrice") or row.get("yes_price"), 0.0),
         "no_price": safe_float(row.get("noPrice") or row.get("no_price"), 0.0),
     }
+
+
+SPORTS_KEYWORDS = {
+    "nba", "nfl", "nhl", "mlb", "soccer", "football", "basketball", "baseball", "hockey",
+    "tennis", "golf", "mma", "ufc", "boxing", "f1", "formula 1", "premier league",
+    "champions league", "world cup", "ncaa", "march madness", "olympics", "super bowl",
+    "player", "team", "match", "game", "tournament", "season", "playoffs"
+}
+
+CATEGORY_KEYWORDS = {
+    "politics": ["trump", "biden", "election", "senate", "house", "governor", "president", "white house", "democrat", "republican", "gop", "primary", "poll"],
+    "macro": ["fed", "cpi", "inflation", "recession", "rate cut", "interest rate", "treasury", "jobs report", "gdp", "fomc", "economy", "tariff", "yield"],
+    "crypto": ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto", "token", "coin", "blockchain"],
+    "geopolitics": ["ukraine", "russia", "china", "taiwan", "israel", "gaza", "iran", "ceasefire", "nato", "war"],
+    "tech": ["openai", "anthropic", "google", "meta", "apple", "microsoft", "ai", "chatgpt", "claude", "tesla", "spacex"],
+    "law": ["court", "scotus", "supreme court", "lawsuit", "sec", "doj", "trial", "judge", "legal", "regulation"],
+    "weather": ["hurricane", "storm", "earthquake", "wildfire", "weather", "temperature"],
+}
+
+def row_market_text(row: Dict[str, Any]) -> str:
+    parts = [
+        clean_text(row.get("market_question") or ""),
+        clean_text(row.get("question") or row.get("title") or ""),
+        clean_text(row.get("market_slug") or row.get("slug") or row.get("marketSlug") or ""),
+        clean_text(row.get("description") or ""),
+        clean_text(row.get("ticker") or ""),
+    ]
+    return " ".join([p for p in parts if p]).strip().lower()
+
+def is_sports_text(text: str) -> bool:
+    s = clean_text(text).lower()
+    if not s:
+        return False
+    return any(term in s for term in SPORTS_KEYWORDS)
+
+def is_sports_row(row: Dict[str, Any]) -> bool:
+    return is_sports_text(row_market_text(row))
+
+def categorize_text(text: str) -> str:
+    s = clean_text(text).lower()
+    if not s:
+        return "other"
+    if is_sports_text(s):
+        return "sports"
+    best_cat = "other"
+    best_hits = 0
+    for cat, terms in CATEGORY_KEYWORDS.items():
+        hits = sum(1 for term in terms if term in s)
+        if hits > best_hits:
+            best_cat = cat
+            best_hits = hits
+    return best_cat
+
+def categorize_row(row: Dict[str, Any]) -> str:
+    return categorize_text(row_market_text(row))
+
+def dominant_category(counts: Dict[str, int]) -> str:
+    if not counts:
+        return "other"
+    items = sorted(counts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
+    return items[0][0] if items and items[0][1] > 0 else "other"
+
+def top_categories(counts: Dict[str, int], limit: int = 3) -> List[str]:
+    if not counts:
+        return []
+    items = sorted(counts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
+    return [k for k, v in items[:limit] if v > 0]
+
+def safe_ratio(num: float, den: float) -> float:
+    if den <= 0:
+        return 0.0
+    return num / den
+
+def best_observation_window(metrics: Dict[str, Any]) -> str:
+    options = {
+        "1h": safe_float(metrics.get("obs_success_rate_1h"), 0.0),
+        "6h": safe_float(metrics.get("obs_success_rate_6h"), 0.0),
+        "24h": safe_float(metrics.get("obs_success_rate_24h"), 0.0),
+    }
+    best = max(options.items(), key=lambda kv: kv[1])
+    return best[0] if best[1] > 0 else "none"
+
+def timing_style(metrics: Dict[str, Any]) -> str:
+    s1 = safe_float(metrics.get("obs_success_rate_1h"), 0.0)
+    s6 = safe_float(metrics.get("obs_success_rate_6h"), 0.0)
+    s24 = safe_float(metrics.get("obs_success_rate_24h"), 0.0)
+    if s1 >= 0.60 and s1 >= s24:
+        return "fast-entry"
+    if s24 >= 0.60 and s24 > s1:
+        return "patient-hold"
+    if s6 > 0 or s24 > 0 or s1 > 0:
+        return "mixed"
+    return "unproven"
+
+def similarity_distance(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    vals = [
+        abs(safe_float(a.get("weighted_return_30d"), 0.0) - safe_float(b.get("weighted_return_30d"), 0.0)) * 100.0,
+        abs(safe_float(a.get("win_rate_30d"), 0.0) - safe_float(b.get("win_rate_30d"), 0.0)) * 50.0,
+        abs(safe_float(a.get("consistency_ratio_30d"), 0.0) - safe_float(b.get("consistency_ratio_30d"), 0.0)) * 40.0,
+        abs(safe_float(a.get("obs_success_rate_24h"), 0.0) - safe_float(b.get("obs_success_rate_24h"), 0.0)) * 50.0,
+        abs(safe_float(a.get("recent_trades_7d"), 0.0) - safe_float(b.get("recent_trades_7d"), 0.0)) / 5.0,
+    ]
+    score = sum(vals)
+    if clean_text(a.get("top_category_30d")) != clean_text(b.get("top_category_30d")):
+        score += 8.0
+    if clean_text(a.get("timing_style")) != clean_text(b.get("timing_style")):
+        score += 4.0
+    return score
+
+def annotate_similar_wallets(rows: List[Dict[str, Any]]) -> None:
+    eligible = [r for r in rows if r.get("passes_filters")]
+    if len(eligible) < 2:
+        return
+    for row in eligible:
+        peers = []
+        for other in eligible:
+            if other.get("wallet") == row.get("wallet"):
+                continue
+            peers.append((similarity_distance(row, other), other))
+        peers.sort(key=lambda x: x[0])
+        similar = []
+        for dist, other in peers[:SIMILAR_WALLETS_LIMIT]:
+            similar.append({
+                "wallet": other.get("wallet"),
+                "username": other.get("username", ""),
+                "bucket": other.get("bucket", ""),
+                "score": other.get("score", 0.0),
+                "top_category_30d": other.get("top_category_30d", ""),
+                "timing_style": other.get("timing_style", ""),
+            })
+        row["similar_wallets"] = similar
+
+def pattern_summary_line(row: Dict[str, Any]) -> str:
+    cat = clean_text(row.get("top_category_30d") or "other")
+    timing = clean_text(row.get("timing_style") or "unproven")
+    best_window = clean_text(row.get("best_observation_window") or "none")
+    parts = [f"category={cat}", f"timing={timing}", f"best_window={best_window}"]
+    obs24 = safe_int(row.get("obs_sample_24h"), 0)
+    if obs24 > 0:
+        parts.append(f"obs24={safe_float(row.get('obs_success_rate_24h'), 0.0):.1%}")
+    obs1 = safe_int(row.get("obs_sample_1h"), 0)
+    if obs1 > 0:
+        parts.append(f"obs1={safe_float(row.get('obs_success_rate_1h'), 0.0):.1%}")
+    return "Pattern: " + " | ".join(parts)
 
 
 # =========================================================
@@ -731,6 +878,7 @@ def evaluate_due_observations() -> Dict[str, int]:
     return updated
 
 
+
 def fetch_observation_stats(wallet: str) -> Dict[str, Any]:
     conn = get_db()
     try:
@@ -755,7 +903,20 @@ def fetch_observation_stats(wallet: str) -> Dict[str, Any]:
         ).fetchone()
         if not row:
             return {}
-        return {k: row[k] for k in row.keys()}
+        out = {k: row[k] for k in row.keys()}
+        cat_rows = cur.execute(
+            """
+            SELECT market_question, market_slug
+            FROM observed_trades
+            WHERE wallet = ?
+            """,
+            (wallet,),
+        ).fetchall()
+        counts = defaultdict(int)
+        for r in cat_rows:
+            counts[categorize_text(clean_text((r["market_question"] or "") + " " + (r["market_slug"] or "")))] += 1
+        out["observed_categories"] = top_categories(dict(counts), limit=3)
+        return out
     finally:
         conn.close()
 
@@ -843,50 +1004,6 @@ def bucket_score(wallet_metrics: Dict[str, Any]) -> float:
     return round(clamp(score, 0.0, 100.0), 2)
 
 
-
-
-SPORTS_KEYWORDS = [
-    "sport", "sports", "nba", "wnba", "nfl", "mlb", "nhl", "ncaa", "ncaa basketball",
-    "ncaa football", "march madness", "final four", "super bowl", "world series",
-    "stanley cup", "premier league", "champions league", "uefa", "fifa", "world cup",
-    "soccer", "football", "basketball", "baseball", "hockey", "tennis", "golf",
-    "mma", "ufc", "boxing", "race", "racing", "nascar", "formula 1", "f1",
-    "cricket", "rugby", "olympics"
-]
-
-def row_text_blob(row: Dict[str, Any]) -> str:
-    parts: List[str] = []
-    keys = [
-        "title", "question", "description", "slug", "category", "subcategory", "groupTitle",
-        "group", "eventTitle", "event", "market", "conditionId", "tokenName", "outcome",
-        "tag", "tags"
-    ]
-    for k in keys:
-        v = row.get(k)
-        if isinstance(v, str):
-            parts.append(v.lower())
-        elif isinstance(v, list):
-            for item in v:
-                if isinstance(item, str):
-                    parts.append(item.lower())
-                elif isinstance(item, dict):
-                    for dv in item.values():
-                        if isinstance(dv, str):
-                            parts.append(dv.lower())
-    return " | ".join(parts)
-
-def is_sports_row(row: Dict[str, Any]) -> bool:
-    blob = row_text_blob(row)
-    if not blob:
-        return False
-    return any(kw in blob for kw in SPORTS_KEYWORDS)
-
-def sports_ratio(sports_count: int, total_count: int) -> float:
-    total = safe_int(total_count, 0)
-    if total <= 0:
-        return 0.0
-    return safe_int(sports_count, 0) / float(total)
-
 def classify_bucket(wallet_metrics: Dict[str, Any]) -> str:
     score = wallet_metrics.get("score", 0.0)
     obs_sample_24h = safe_int(wallet_metrics.get("obs_sample_24h"), 0)
@@ -936,11 +1053,19 @@ def reason_strings(metrics: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     else:
         weak.append("no 24h observation sample yet")
 
+    top_cat = clean_text(metrics.get("top_category_30d") or "")
+    if top_cat and top_cat != "other":
+        good.append(f"best category {top_cat}")
+
+    timing = clean_text(metrics.get("timing_style") or "")
+    if timing and timing != "unproven":
+        good.append(f"timing style {timing}")
+
     if metrics.get("trade_count_capped"):
         weak.append("trade count hit cap, so activity may be understated")
     sports_total = safe_int(metrics.get("sports_closed_positions_30d"), 0) + safe_int(metrics.get("sports_trades_30d"), 0) + safe_int(metrics.get("sports_current_positions"), 0)
     if sports_total > 0:
-        weak.append(f"sports exposure seen in sample ({sports_total})")
+        weak.append(f"sports exposure ratios c={safe_float(metrics.get('sports_ratio_closed'), 0.0):.0%} t={safe_float(metrics.get('sports_ratio_trades'), 0.0):.0%}")
     if metrics.get("no_losers_seen"):
         weak.append("no losers seen in sample, so perfection may be overstated")
 
@@ -959,6 +1084,10 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
     sports_rows_30d = 0
     sports_trade_rows_30d = 0
     sports_current_positions = 0
+    closed_category_counts: Dict[str, int] = defaultdict(int)
+    trade_category_counts: Dict[str, int] = defaultdict(int)
+    current_category_counts: Dict[str, int] = defaultdict(int)
+    holder_category_counts: Dict[str, int] = defaultdict(int)
 
     closed_30d: List[Dict[str, Any]] = []
     trade_30d: List[Dict[str, Any]] = []
@@ -969,6 +1098,7 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
         if ts is None or ts < cutoff_30d:
             continue
         closed_30d.append(row)
+        closed_category_counts[categorize_row(row)] += 1
         if EXCLUDE_SPORTS_WALLETS and is_sports_row(row):
             sports_rows_30d += 1
 
@@ -978,6 +1108,7 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
             continue
         if ts >= cutoff_30d:
             trade_30d.append(row)
+            trade_category_counts[categorize_row(row)] += 1
             if EXCLUDE_SPORTS_WALLETS and is_sports_row(row):
                 sports_trade_rows_30d += 1
         if ts >= cutoff_7d:
@@ -985,6 +1116,7 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
 
     if EXCLUDE_SPORTS_WALLETS:
         for row in current_positions:
+            current_category_counts[categorize_row(row)] += 1
             if is_sports_row(row):
                 sports_current_positions += 1
 
@@ -1028,6 +1160,16 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
         by_slug_day[key][side] += 1
     intraday_roundtrips = sum(1 for v in by_slug_day.values() if v["BUY"] > 0 and v["SELL"] > 0)
 
+    for m in (candidate.get("holder_markets") or []):
+        holder_category_counts[categorize_text(clean_text(m.get("slug") or m.get("question") or ""))] += 1
+
+    top_category = dominant_category(dict(closed_category_counts or trade_category_counts or current_category_counts or holder_category_counts))
+    sports_ratio_closed = safe_ratio(sports_rows_30d, len(closed_30d))
+    sports_ratio_trades = safe_ratio(sports_trade_rows_30d, len(trade_30d))
+    sports_ratio_current = safe_ratio(sports_current_positions, len(current_positions))
+    holder_sports = holder_category_counts.get("sports", 0)
+    sports_ratio_holder = safe_ratio(holder_sports, sum(holder_category_counts.values()))
+
     obs = fetch_observation_stats(wallet)
     metrics: Dict[str, Any] = {
         "wallet": wallet,
@@ -1053,6 +1195,12 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "sports_closed_positions_30d": sports_rows_30d,
         "sports_trades_30d": sports_trade_rows_30d,
         "sports_current_positions": sports_current_positions,
+        "sports_ratio_closed": sports_ratio_closed,
+        "sports_ratio_trades": sports_ratio_trades,
+        "sports_ratio_current": sports_ratio_current,
+        "sports_ratio_holder": sports_ratio_holder,
+        "top_category_30d": top_category,
+        "top_categories_30d": top_categories(dict(closed_category_counts or trade_category_counts or current_category_counts or holder_category_counts)),
         "obs_sample_1h": safe_int(obs.get("sample_1h"), 0),
         "obs_sample_6h": safe_int(obs.get("sample_6h"), 0),
         "obs_sample_24h": safe_int(obs.get("sample_24h"), 0),
@@ -1061,18 +1209,10 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "obs_success_rate_24h": safe_float(obs.get("success_rate_24h"), 0.0),
         "obs_avg_move_24h": safe_float(obs.get("avg_move_24h"), 0.0),
         "observed_total": safe_int(obs.get("observed_total"), 0),
+        "observed_categories": obs.get("observed_categories") or [],
     }
-    holder_markets = candidate.get("holder_markets") or []
-    holder_sports_count = sum(
-        1 for m in holder_markets
-        if is_sports_text(clean_text(m.get("slug") or m.get("question") or m.get("title") or ""))
-    )
-
-    metrics["sports_ratio_closed_30d"] = sports_ratio(sports_rows_30d, len(closed_30d))
-    metrics["sports_ratio_trades_30d"] = sports_ratio(sports_trade_rows_30d, len(trade_30d))
-    metrics["sports_ratio_current_positions"] = sports_ratio(sports_current_positions, len(current_positions))
-    metrics["sports_ratio_holder_hints"] = sports_ratio(holder_sports_count, len(holder_markets))
-
+    metrics["best_observation_window"] = best_observation_window(metrics)
+    metrics["timing_style"] = timing_style(metrics)
     metrics["score"] = bucket_score(metrics)
     metrics["bucket"] = classify_bucket(metrics)
     metrics["good_reasons"], metrics["weak_reasons"] = reason_strings(metrics)
@@ -1080,31 +1220,12 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
     sports_ok = (
         not EXCLUDE_SPORTS_WALLETS
         or (
-            metrics["sports_ratio_closed_30d"] <= SPORTS_RATIO_CLOSED_MAX
-            and metrics["sports_ratio_trades_30d"] <= SPORTS_RATIO_TRADES_MAX
-            and metrics["sports_ratio_current_positions"] <= SPORTS_RATIO_CURRENT_MAX
-            and metrics["sports_ratio_holder_hints"] <= SPORTS_RATIO_HOLDER_HINT_MAX
+            sports_ratio_closed <= SPORTS_RATIO_CLOSED_MAX
+            and sports_ratio_trades <= SPORTS_RATIO_TRADES_MAX
+            and sports_ratio_current <= SPORTS_RATIO_CURRENT_MAX
+            and sports_ratio_holder <= SPORTS_RATIO_HOLDER_HINT_MAX
         )
     )
-
-    if not sports_ok:
-        metrics["reject_reason"] = "sports_dominant"
-    elif metrics["closed_positions_30d"] < MIN_CLOSED_POSITIONS_30D:
-        metrics["reject_reason"] = "not_enough_closed_positions"
-    elif metrics["trades_30d"] < MIN_TRADES_30D:
-        metrics["reject_reason"] = "not_enough_trades"
-    elif metrics["weighted_return_30d"] < MIN_WEIGHTED_RETURN_30D:
-        metrics["reject_reason"] = "weighted_return_too_low"
-    elif metrics["win_rate_30d"] < MIN_WIN_RATE_30D:
-        metrics["reject_reason"] = "win_rate_too_low"
-    elif metrics["consistency_ratio_30d"] < MIN_CONSISTENCY_RATIO:
-        metrics["reject_reason"] = "consistency_too_low"
-    elif metrics["realized_pnl_30d"] < MIN_REALIZED_PNL_30D:
-        metrics["reject_reason"] = "realized_pnl_too_low"
-    elif metrics["recent_trades_7d"] < MIN_RECENT_TRADES_7D:
-        metrics["reject_reason"] = "recent_activity_too_low"
-    else:
-        metrics["reject_reason"] = ""
 
     passes = (
         metrics["closed_positions_30d"] >= MIN_CLOSED_POSITIONS_30D
@@ -1158,6 +1279,10 @@ def format_wallet_row(row: Dict[str, Any]) -> List[str]:
         lines.append(
             f"Observed: 24h success={safe_float(row.get('obs_success_rate_24h'), 0.0):.1%} on {obs_sample_24h} samples | avg_24h_move={safe_float(row.get('obs_avg_move_24h'), 0.0):.1%}"
         )
+    lines.append(pattern_summary_line(row))
+    similar = row.get("similar_wallets") or []
+    if similar:
+        lines.append("Similar: " + " | ".join([f"{clean_text(x.get('username') or x.get('wallet') or '')} ({clean_text(x.get('top_category_30d') or 'other')}, {clean_text(x.get('timing_style') or 'unproven')})" for x in similar]))
     lines.append(f"Why: {'; '.join(row.get('good_reasons') or ['none'])}")
     lines.append(f"Weakness: {'; '.join(row.get('weak_reasons') or ['none'])}")
     lines.append(row_discovery_text(row))
@@ -1182,7 +1307,7 @@ def latest_cached_scan_text() -> str:
             username = clean_text(row.get("username") or "none")
             score = safe_float(row.get("score"), 0.0)
             bucket = clean_text(row.get("bucket") or "UNKNOWN")
-            lines.append(f"{display_name(row)} | username={username} | {wallet} | bucket={bucket} | score={score:.1f} | profile=https://polymarket.com/profile/{wallet}")
+            lines.append(f"{display_name(row)} | username={username} | {wallet} | bucket={bucket} | score={score:.1f} | category={clean_text(row.get('top_category_30d') or 'other')} | profile=https://polymarket.com/profile/{wallet}")
     else:
         lines.append("None")
     return "\n".join(lines).strip()
@@ -1223,13 +1348,6 @@ def format_scan_text(result: Dict[str, Any], manual: bool = False) -> str:
             lines.append("")
     else:
         lines.append("None")
-
-    reject_counts = result.get("reject_reason_counts") or {}
-    if reject_counts:
-        lines.append("")
-        lines.append("Top reject reasons")
-        parts = [f"{k}:{v}" for k, v in sorted(reject_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
-        lines.append(" | ".join(parts[:8]))
     return "\n".join(lines).strip()
 
 
@@ -1245,7 +1363,7 @@ def format_group_text(group_payload: Dict[str, Any]) -> str:
     if top:
         for row in top:
             lines.append(
-                f"{display_name(row)} | username={clean_text(row.get('username') or 'none')} | {clean_text(row.get('wallet') or '')} | seen={safe_int(row.get('seen_count'), 0)} | best_score={safe_float(row.get('best_score'), 0.0):.1f} | best_bucket={row.get('best_bucket', 'UNKNOWN')} | profile=https://polymarket.com/profile/{clean_text(row.get('wallet') or '')}"
+                f"{display_name(row)} | username={clean_text(row.get('username') or 'none')} | {clean_text(row.get('wallet') or '')} | seen={safe_int(row.get('seen_count'), 0)} | best_score={safe_float(row.get('best_score'), 0.0):.1f} | best_bucket={row.get('best_bucket', 'UNKNOWN')} | category={clean_text(row.get('top_category_30d') or 'other')} | timing={clean_text(row.get('timing_style') or 'unproven')} | profile=https://polymarket.com/profile/{clean_text(row.get('wallet') or '')}"
             )
     else:
         lines.append("None")
@@ -1331,15 +1449,11 @@ def scan_once(manual_quick: bool = False) -> Dict[str, Any]:
         reverse=True,
     )
 
+    annotate_similar_wallets(evaluated)
+
     test_first = [x for x in evaluated if x.get("bucket") == "TEST FIRST" and x.get("passes_filters")][:TOP_WALLETS_PER_SCAN]
     watch_closely = [x for x in evaluated if x.get("bucket") == "WATCH CLOSELY" and x.get("passes_filters")][:TOP_WALLETS_PER_SCAN]
     rejects = [x for x in evaluated if not x.get("passes_filters")][:TOP_WALLETS_PER_SCAN]
-    reject_reason_counts: Dict[str, int] = {}
-    for row in evaluated:
-        if row.get("passes_filters"):
-            continue
-        reason = clean_text(row.get("reject_reason") or "other")
-        reject_reason_counts[reason] = reject_reason_counts.get(reason, 0) + 1
 
     observations_logged = 0
     for row in test_first + watch_closely:
@@ -1366,7 +1480,6 @@ def scan_once(manual_quick: bool = False) -> Dict[str, Any]:
         "test_first": test_first,
         "watch_closely": watch_closely,
         "rejects": rejects,
-        "reject_reason_counts": reject_reason_counts,
         "time_budget_hit": time_budget_hit,
         "scan_runtime_seconds": round(utc_ts() - started, 2),
         "timestamp": iso_utc(now_utc()),
@@ -1385,6 +1498,8 @@ def update_runtime_after_scan(result: Dict[str, Any]) -> None:
                         "username": row.get("username"),
                         "score": row.get("score"),
                         "bucket": row.get("bucket"),
+                        "top_category_30d": row.get("top_category_30d"),
+                        "timing_style": row.get("timing_style"),
                     }
                     for row in (
                         (result.get("test_first") or [])
@@ -1435,6 +1550,8 @@ def build_group_payload() -> Dict[str, Any]:
                     "seen_count": 0,
                     "best_score": 0.0,
                     "best_bucket": "",
+                    "top_category_30d": row.get("top_category_30d", ""),
+                    "timing_style": row.get("timing_style", ""),
                 },
             )
             base["seen_count"] += 1
@@ -1443,6 +1560,10 @@ def build_group_payload() -> Dict[str, Any]:
                 base["best_bucket"] = row.get("bucket", "")
             if row.get("username"):
                 base["username"] = row.get("username")
+            if row.get("top_category_30d"):
+                base["top_category_30d"] = row.get("top_category_30d")
+            if row.get("timing_style"):
+                base["timing_style"] = row.get("timing_style")
 
     top_group_wallets = sorted(
         wallet_map.values(),
