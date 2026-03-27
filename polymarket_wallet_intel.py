@@ -16,7 +16,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "wallet-intel-v7-patterns"
+SCRIPT_VERSION = "wallet-intel-v8.3-scoring-timing"
 UTC = timezone.utc
 
 # =========================================================
@@ -69,8 +69,8 @@ MIN_CONSISTENCY_RATIO = float(os.getenv("MIN_CONSISTENCY_RATIO", "0.50"))
 MIN_REALIZED_PNL_30D = float(os.getenv("MIN_REALIZED_PNL_30D", "0.0"))
 MIN_RECENT_TRADES_7D = int(os.getenv("MIN_RECENT_TRADES_7D", "2"))
 MIN_INTRADAY_SIGNALS = int(os.getenv("MIN_INTRADAY_SIGNALS", "1"))
-WATCH_BUCKET_MIN_SCORE = float(os.getenv("WATCH_BUCKET_MIN_SCORE", "60"))
-TEST_FIRST_MIN_SCORE = float(os.getenv("TEST_FIRST_MIN_SCORE", "75"))
+WATCH_BUCKET_MIN_SCORE = float(os.getenv("WATCH_BUCKET_MIN_SCORE", "50"))
+TEST_FIRST_MIN_SCORE = float(os.getenv("TEST_FIRST_MIN_SCORE", "68"))
 
 # Observation settings
 OBS_DB_PATH = os.getenv("OBS_DB_PATH", "/tmp/polymarket_wallet_intel.db")
@@ -973,34 +973,37 @@ def bucket_score(wallet_metrics: Dict[str, Any]) -> float:
     obs_sample_24h = safe_int(wallet_metrics.get("obs_sample_24h"), 0)
     obs_success_24h = safe_float(wallet_metrics.get("obs_success_rate_24h"), 0.0)
 
-    ret_score = clamp(weighted_return / 0.40, 0.0, 1.0) * 30.0
-    win_score = clamp((win_rate - 0.50) / 0.30, 0.0, 1.0) * 15.0
-    consistency_score = clamp((consistency - 0.40) / 0.40, 0.0, 1.0) * 15.0
-    activity_score = clamp(recent_trades / 12.0, 0.0, 1.0) * 10.0
-    intraday_score = clamp(intraday / 5.0, 0.0, 1.0) * 10.0
-    sample_score = clamp(sample / 20.0, 0.0, 1.0) * 10.0
-    obs_score = 0.0
+    # v8.3 rebalance: profitability and repeatability first, timing third
+    ret_score = clamp(weighted_return / 0.40, 0.0, 1.0) * 35.0
+    win_score = clamp((win_rate - 0.50) / 0.30, 0.0, 1.0) * 25.0
+    consistency_score = clamp((consistency - 0.40) / 0.40, 0.0, 1.0) * 20.0
+    activity_score = clamp(recent_trades / 20.0, 0.0, 1.0) * 10.0
+
+    timing_input = clamp(intraday / 5.0, 0.0, 1.0)
     if obs_sample_24h > 0:
-        obs_score = clamp(obs_success_24h / 0.75, 0.0, 1.0) * 10.0
+        timing_input = max(timing_input, clamp(obs_success_24h / 0.75, 0.0, 1.0))
+    timing_score = timing_input * 10.0
 
-    score = ret_score + win_score + consistency_score + activity_score + intraday_score + sample_score + obs_score
+    sample_bonus = clamp(sample / 15.0, 0.0, 1.0) * 5.0
 
-    # realism penalties
-    if sample < 15 and win_rate >= 1.0:
-        score -= 8.0
-    if sample < 15 and consistency >= 1.0:
-        score -= 6.0
-    if safe_int(wallet_metrics.get("trades_30d"), 0) >= 100:
+    score = ret_score + win_score + consistency_score + activity_score + timing_score + sample_bonus
+
+    # realism penalties: softer than v8.2 so strong directional wallets are not mislabeled
+    if sample < 8 and win_rate >= 1.0:
         score -= 4.0
+    if sample < 8 and consistency >= 1.0:
+        score -= 3.0
+    if safe_int(wallet_metrics.get("trades_30d"), 0) >= 100:
+        score -= 2.0
         wallet_metrics["trade_count_capped"] = True
     if sample > 0 and wallet_metrics.get("losing_positions_30d", 0) == 0:
-        score -= 6.0
+        score -= 3.0
         wallet_metrics["no_losers_seen"] = True
     if obs_sample_24h >= OBS_MIN_SAMPLE_24H:
         if obs_success_24h >= OBS_PROMOTE_SUCCESS_RATE:
-            score += 6.0
+            score += 5.0
         elif obs_success_24h <= OBS_DEMOTE_SUCCESS_RATE:
-            score -= 8.0
+            score -= 6.0
     return round(clamp(score, 0.0, 100.0), 2)
 
 
