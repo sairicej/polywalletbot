@@ -16,7 +16,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "wallet-intel-v9-behavior-intelligence"
+SCRIPT_VERSION = "wallet-intel-v10-execution-intelligence"
 UTC = timezone.utc
 
 # =========================================================
@@ -1469,7 +1469,7 @@ def latest_cached_scan_text() -> str:
             username = clean_text(row.get("username") or "none")
             score = safe_float(row.get("score"), 0.0)
             bucket = clean_text(row.get("bucket") or "UNKNOWN")
-            lines.append(f"{display_name(row)} | username={username} | {wallet} | bucket={bucket} | score={score:.1f} | category={clean_text(row.get('top_category_30d') or 'other')} | band={clean_text(row.get('dominant_entry_band') or 'unknown')} | hold={clean_text(row.get('hold_style') or 'unknown')} | profile=https://polymarket.com/profile/{wallet}")
+            lines.append(f"{display_name(row)} | username={username} | {wallet} | bucket={bucket} | score={score:.1f} | category={clean_text(row.get('top_category_30d') or 'other')} | band={clean_text(row.get('dominant_entry_band') or 'unknown')} | hold={clean_text(row.get('hold_style') or 'unknown')} | exec={clean_text(row.get('execution_style') or 'unproven')} | action={clean_text(row.get('actionability_label') or 'observe-only')} | profile=https://polymarket.com/profile/{wallet}")
     else:
         lines.append("None")
     return "\n".join(lines).strip()
