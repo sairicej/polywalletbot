@@ -16,7 +16,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "wallet-intel-v10-execution-intelligence"
+SCRIPT_VERSION = "wallet-intel-v10.1-execution-validation"
 UTC = timezone.utc
 
 # =========================================================
@@ -638,6 +638,108 @@ def behavior_fingerprint(metrics: Dict[str, Any]) -> str:
     conviction = clean_text(metrics.get("conviction_style") or "broad-scan")
     return f"{cat}:{band}:{hold}:{conviction}"
 
+
+def validated_execution_style(metrics: Dict[str, Any]) -> str:
+    band = clean_text(metrics.get("dominant_entry_band") or "unknown")
+    s1 = safe_float(metrics.get("obs_success_rate_1h"), 0.0)
+    s6 = safe_float(metrics.get("obs_success_rate_6h"), 0.0)
+    s24 = safe_float(metrics.get("obs_success_rate_24h"), 0.0)
+    m1 = safe_float(metrics.get("obs_avg_move_1h"), 0.0)
+    m6 = safe_float(metrics.get("obs_avg_move_6h"), 0.0)
+    sample_1h = safe_int(metrics.get("obs_sample_1h"), 0)
+    sample_6h = safe_int(metrics.get("obs_sample_6h"), 0)
+    sample_24h = safe_int(metrics.get("obs_sample_24h"), 0)
+
+    if sample_1h >= OBS_MIN_SAMPLE_24H and band in ("early", "mid") and s1 >= 0.60 and m1 >= OBS_SUCCESS_THRESHOLD:
+        return "anticipatory"
+    if sample_6h >= OBS_MIN_SAMPLE_24H and band == "late" and s6 >= 0.58 and m6 >= OBS_SUCCESS_THRESHOLD:
+        return "momentum-follow"
+    if sample_24h >= OBS_MIN_SAMPLE_24H and s24 >= 0.62 and s1 < 0.55:
+        return "confirmatory"
+    if sample_1h >= OBS_MIN_SAMPLE_24H and band == "late" and s1 < 0.45 and s6 < 0.55:
+        return "chase-risk"
+    if sample_1h > 0 or sample_6h > 0 or sample_24h > 0:
+        return "mixed"
+    return "unproven"
+
+def execution_copyability_score(metrics: Dict[str, Any]) -> float:
+    band = clean_text(metrics.get("dominant_entry_band") or "unknown")
+    style = clean_text(metrics.get("execution_style") or "unproven")
+    s1 = safe_float(metrics.get("obs_success_rate_1h"), 0.0)
+    s6 = safe_float(metrics.get("obs_success_rate_6h"), 0.0)
+    s24 = safe_float(metrics.get("obs_success_rate_24h"), 0.0)
+    m1 = safe_float(metrics.get("obs_avg_move_1h"), 0.0)
+    m6 = safe_float(metrics.get("obs_avg_move_6h"), 0.0)
+    sample_total = max(
+        safe_int(metrics.get("obs_sample_1h"), 0),
+        safe_int(metrics.get("obs_sample_6h"), 0),
+        safe_int(metrics.get("obs_sample_24h"), 0),
+    )
+    recent = safe_int(metrics.get("recent_trades_7d"), 0)
+    score = 0.0
+    score += clamp(s1 / 0.75, 0.0, 1.0) * 30.0
+    score += clamp(s6 / 0.75, 0.0, 1.0) * 20.0
+    score += clamp(s24 / 0.75, 0.0, 1.0) * 10.0
+    score += clamp(m1 / 0.08, 0.0, 1.0) * 10.0
+    score += clamp(m6 / 0.12, 0.0, 1.0) * 10.0
+    score += clamp(recent / 30.0, 0.0, 1.0) * 10.0
+    if band == "mid":
+        score += 6.0
+    elif band == "early":
+        score += 8.0
+    elif band == "late":
+        score -= 4.0
+    if style == "anticipatory":
+        score += 10.0
+    elif style == "momentum-follow":
+        score += 4.0
+    elif style == "confirmatory":
+        score += 2.0
+    elif style == "chase-risk":
+        score -= 12.0
+    if sample_total < OBS_MIN_SAMPLE_24H:
+        score -= 18.0
+    return round(clamp(score, 0.0, 100.0), 1)
+
+def execution_readiness(metrics: Dict[str, Any]) -> str:
+    score = safe_float(metrics.get("copyability_score"), 0.0)
+    sample_total = max(
+        safe_int(metrics.get("obs_sample_1h"), 0),
+        safe_int(metrics.get("obs_sample_6h"), 0),
+        safe_int(metrics.get("obs_sample_24h"), 0),
+    )
+    if sample_total >= OBS_MIN_SAMPLE_24H and score >= 70:
+        return "high"
+    if score >= 45:
+        return "medium"
+    return "low"
+
+def execution_risk(metrics: Dict[str, Any]) -> str:
+    style = clean_text(metrics.get("execution_style") or "unproven")
+    band = clean_text(metrics.get("dominant_entry_band") or "unknown")
+    if style == "chase-risk":
+        return "chase-risk"
+    if band == "late":
+        return "crowded-book"
+    if style == "unproven":
+        return "timing-risk"
+    return "balanced"
+
+def actionability_label(metrics: Dict[str, Any]) -> str:
+    readiness = clean_text(metrics.get("execution_readiness") or "low")
+    style = clean_text(metrics.get("execution_style") or "unproven")
+    bucket = clean_text(metrics.get("bucket") or "REJECT")
+    sample_total = max(
+        safe_int(metrics.get("obs_sample_1h"), 0),
+        safe_int(metrics.get("obs_sample_6h"), 0),
+        safe_int(metrics.get("obs_sample_24h"), 0),
+    )
+    if bucket == "TEST FIRST" and readiness == "high" and style in ("anticipatory", "momentum-follow"):
+        return "copy-candidate"
+    if bucket == "TEST FIRST" and readiness in ("medium", "high") and sample_total > 0:
+        return "watch-for-entry"
+    return "observe-only"
+
 def similarity_distance(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     vals = [
         abs(safe_float(a.get("weighted_return_30d"), 0.0) - safe_float(b.get("weighted_return_30d"), 0.0)) * 100.0,
@@ -700,6 +802,11 @@ def pattern_summary_line(row: Dict[str, Any]) -> str:
     obs1 = safe_int(row.get("obs_sample_1h"), 0)
     if obs1 > 0:
         parts.append(f"obs1={safe_float(row.get('obs_success_rate_1h'), 0.0):.1%}")
+        parts.append(f"m1={safe_float(row.get('obs_avg_move_1h'), 0.0):.1%}")
+    obs6 = safe_int(row.get("obs_sample_6h"), 0)
+    if obs6 > 0:
+        parts.append(f"obs6={safe_float(row.get('obs_success_rate_6h'), 0.0):.1%}")
+        parts.append(f"m6={safe_float(row.get('obs_avg_move_6h'), 0.0):.1%}")
     return "Pattern: " + " | ".join(parts)
 
 
@@ -1363,6 +1470,8 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "obs_success_rate_1h": safe_float(obs.get("success_rate_1h"), 0.0),
         "obs_success_rate_6h": safe_float(obs.get("success_rate_6h"), 0.0),
         "obs_success_rate_24h": safe_float(obs.get("success_rate_24h"), 0.0),
+        "obs_avg_move_1h": safe_float(obs.get("avg_move_1h"), 0.0),
+        "obs_avg_move_6h": safe_float(obs.get("avg_move_6h"), 0.0),
         "obs_avg_move_24h": safe_float(obs.get("avg_move_24h"), 0.0),
         "observed_total": safe_int(obs.get("observed_total"), 0),
         "observed_categories": obs.get("observed_categories") or [],
@@ -1372,8 +1481,14 @@ def evaluate_wallet(candidate: Dict[str, Any]) -> Dict[str, Any]:
     metrics["hold_style"] = hold_style(metrics)
     metrics["conviction_style"] = conviction_style(metrics)
     metrics["behavior_fingerprint"] = behavior_fingerprint(metrics)
+    metrics["execution_style"] = validated_execution_style(metrics)
+    metrics["copyability_score"] = execution_copyability_score(metrics)
+    metrics["execution_readiness"] = execution_readiness(metrics)
+    metrics["execution_risk"] = execution_risk(metrics)
+    metrics["actionability_label"] = actionability_label(metrics)
     metrics["score"] = bucket_score(metrics)
     metrics["bucket"] = classify_bucket(metrics)
+    metrics["actionability_label"] = actionability_label(metrics)
     metrics["good_reasons"], metrics["weak_reasons"] = reason_strings(metrics)
 
     sports_ok = (
@@ -1441,6 +1556,9 @@ def format_wallet_row(row: Dict[str, Any]) -> List[str]:
     lines.append(pattern_summary_line(row))
     lines.append(
         f"Behavior: fingerprint={clean_text(row.get('behavior_fingerprint') or 'unknown')} | hold_hours={safe_float(row.get('median_hold_hours_30d'), 0.0):.1f} | entry_mix=e:{safe_int(row.get('entry_band_early_count'), 0)}/m:{safe_int(row.get('entry_band_mid_count'), 0)}/l:{safe_int(row.get('entry_band_late_count'), 0)}"
+    )
+    lines.append(
+        f"Execution: style={clean_text(row.get('execution_style') or 'unproven')} | copyability={safe_float(row.get('copyability_score'), 0.0):.1f} | readiness={clean_text(row.get('execution_readiness') or 'low')} | risk={clean_text(row.get('execution_risk') or 'timing-risk')} | action={clean_text(row.get('actionability_label') or 'observe-only')}"
     )
     similar = row.get("similar_wallets") or []
     if similar:
