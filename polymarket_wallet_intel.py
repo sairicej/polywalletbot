@@ -16,7 +16,7 @@ app = Flask(__name__)
 # =========================================================
 # Version
 # =========================================================
-SCRIPT_VERSION = "wallet-intel-v10.1-execution-validation"
+SCRIPT_VERSION = "wallet-intel-v10.2-observation-evaluator"
 UTC = timezone.utc
 
 # =========================================================
@@ -25,6 +25,7 @@ UTC = timezone.utc
 DATA_API_BASE = os.getenv("DATA_API_BASE", "https://data-api.polymarket.com")
 DATA_API_V1_BASE = os.getenv("DATA_API_V1_BASE", f"{DATA_API_BASE}/v1")
 GAMMA_BASE = os.getenv("GAMMA_BASE", "https://gamma-api.polymarket.com")
+CLOB_API_BASE = os.getenv("CLOB_API_BASE", "https://clob.polymarket.com")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
@@ -244,6 +245,64 @@ def fetch_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
     return resp.json()
 
 
+def infer_asset_id(row: Dict[str, Any]) -> str:
+    for key in ["assetId", "asset_id", "tokenId", "tokenID", "token_id"]:
+        val = clean_text(row.get(key) or "")
+        if val:
+            return val
+    return ""
+
+def fetch_current_price_from_asset(asset_id: str) -> float:
+    asset_id = clean_text(asset_id or "")
+    if not asset_id:
+        return 0.0
+    attempts = [
+        (f"{CLOB_API_BASE}/price", {"token_id": asset_id}),
+        (f"{CLOB_API_BASE}/midpoint", {"token_id": asset_id}),
+        (f"{CLOB_API_BASE}/prices-history", {"market": asset_id, "interval": "max"}),
+    ]
+    for url, params in attempts:
+        try:
+            data = fetch_json(url, params=params)
+        except Exception:
+            continue
+        if isinstance(data, (int, float)):
+            val = safe_float(data, 0.0)
+            if val > 0:
+                return val
+        if isinstance(data, dict):
+            for key in ["price", "mid", "midpoint", "value"]:
+                val = safe_float(data.get(key), 0.0)
+                if val > 0:
+                    return val
+            history = data.get("history") or data.get("data") or data.get("prices")
+            if isinstance(history, list) and history:
+                last = history[-1]
+                if isinstance(last, dict):
+                    for key in ["p", "price", "value", "close"]:
+                        val = safe_float(last.get(key), 0.0)
+                        if val > 0:
+                            return val
+        if isinstance(data, list) and data:
+            last = data[-1]
+            if isinstance(last, dict):
+                for key in ["p", "price", "value", "close"]:
+                    val = safe_float(last.get(key), 0.0)
+                    if val > 0:
+                        return val
+    return 0.0
+
+def refresh_trade_context(slug: str = "", condition_id: str = "") -> Dict[str, Any]:
+    snap = fetch_market_snapshot(slug=slug, condition_id=condition_id) or {}
+    return {
+        "slug": clean_text(snap.get("slug") or slug),
+        "question": clean_text(snap.get("question") or ""),
+        "condition_id": clean_text(snap.get("condition_id") or condition_id),
+        "yes_price": safe_float(snap.get("yes_price"), 0.0),
+        "no_price": safe_float(snap.get("no_price"), 0.0),
+    }
+
+
 def fetch_list(url: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     try:
         data = fetch_json(url, params=params)
@@ -338,6 +397,10 @@ def init_db() -> None:
                 entry_price REAL DEFAULT 0,
                 size REAL DEFAULT 0,
                 source TEXT,
+                asset_id TEXT,
+                entry_yes_price REAL,
+                entry_no_price REAL,
+                price_source TEXT,
                 status TEXT DEFAULT 'open',
                 price_1h REAL,
                 price_6h REAL,
@@ -356,6 +419,16 @@ def init_db() -> None:
 
         cur.execute("CREATE INDEX IF NOT EXISTS idx_observed_wallet_status ON observed_trades(wallet, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_observed_trade_time ON observed_trades(trade_time)")
+
+        cols = {row[1] for row in cur.execute("PRAGMA table_info(observed_trades)").fetchall()}
+        if "asset_id" not in cols:
+            cur.execute("ALTER TABLE observed_trades ADD COLUMN asset_id TEXT")
+        if "entry_yes_price" not in cols:
+            cur.execute("ALTER TABLE observed_trades ADD COLUMN entry_yes_price REAL")
+        if "entry_no_price" not in cols:
+            cur.execute("ALTER TABLE observed_trades ADD COLUMN entry_no_price REAL")
+        if "price_source" not in cols:
+            cur.execute("ALTER TABLE observed_trades ADD COLUMN price_source TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -1001,12 +1074,21 @@ def log_candidate_observations(wallet_row: Dict[str, Any]) -> int:
         slug = clean_text(row.get("slug") or row.get("marketSlug") or row.get("market") or "")
         question = clean_text(row.get("title") or row.get("question") or "")
         condition_id = clean_text(row.get("conditionId") or row.get("marketId") or "")
-        if not slug and not condition_id:
+        asset_id = infer_asset_id(row)
+
+        ctx = refresh_trade_context(slug=slug, condition_id=condition_id)
+        slug = clean_text(ctx.get("slug") or slug)
+        question = clean_text(question or ctx.get("question") or "")
+        condition_id = clean_text(ctx.get("condition_id") or condition_id)
+        entry_yes_price = safe_float(ctx.get("yes_price"), 0.0)
+        entry_no_price = safe_float(ctx.get("no_price"), 0.0)
+
+        if not slug and not condition_id and not asset_id:
             continue
         size = safe_float(row.get("size") or row.get("shares") or row.get("amount"), 0.0)
         source = clean_text(row.get("source") or "trade")
         trade_time = iso_utc(ts)
-        unique_key = make_observation_key(wallet, slug, condition_id, outcome, trade_time, entry_price)
+        unique_key = make_observation_key(wallet, slug, condition_id or asset_id, outcome, trade_time, entry_price)
         rows_to_insert.append(
             (
                 unique_key,
@@ -1023,6 +1105,10 @@ def log_candidate_observations(wallet_row: Dict[str, Any]) -> int:
                 entry_price,
                 size,
                 source,
+                asset_id,
+                entry_yes_price,
+                entry_no_price,
+                "gamma",
                 iso_utc(now_utc()),
                 iso_utc(now_utc()),
             )
@@ -1041,8 +1127,9 @@ def log_candidate_observations(wallet_row: Dict[str, Any]) -> int:
             """
             INSERT OR IGNORE INTO observed_trades (
                 unique_key, wallet, username, bucket, snapshot_score, market_slug, market_question,
-                condition_id, outcome, side, trade_time, entry_price, size, source, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                condition_id, outcome, side, trade_time, entry_price, size, source, asset_id,
+                entry_yes_price, entry_no_price, price_source, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows_to_insert,
         )
@@ -1074,23 +1161,44 @@ def evaluate_due_observations() -> Dict[str, int]:
                 continue
             age_hours = (now - trade_time).total_seconds() / 3600.0
             snapshot = fetch_market_snapshot(slug=row["market_slug"] or "", condition_id=row["condition_id"] or "")
-            if not snapshot:
-                continue
-            current_price = observation_side_price(snapshot, row["outcome"])
+            current_price = 0.0
+            price_source = "none"
+
+            asset_id = clean_text(row["asset_id"] or "")
+            if asset_id:
+                current_price = fetch_current_price_from_asset(asset_id)
+                if current_price > 0:
+                    price_source = "clob"
+
+            if current_price <= 0 and snapshot:
+                current_price = observation_side_price(snapshot, row["outcome"])
+                if current_price > 0:
+                    price_source = "gamma"
+
             entry_price = safe_float(row["entry_price"], 0.0)
-            if current_price <= 0 or entry_price <= 0:
+            if entry_price <= 0:
                 continue
-            move = (current_price - entry_price) / entry_price
+
+            if current_price <= 0:
+                fallback_price = safe_float(row["entry_yes_price"], 0.0) if clean_text(row["outcome"]) == "YES" else safe_float(row["entry_no_price"], 0.0)
+                if fallback_price > 0:
+                    current_price = fallback_price
+                    price_source = "entry-snapshot"
+
+            if current_price <= 0:
+                continue
+
+            move = (current_price - entry_price) / max(entry_price, 1e-9)
             now_iso = iso_utc(now)
 
             if age_hours >= 1 and row["price_1h"] is None:
                 cur.execute(
                     """
                     UPDATE observed_trades
-                    SET price_1h = ?, move_1h = ?, success_1h = ?, updated_at = ?
+                    SET price_1h = ?, move_1h = ?, success_1h = ?, price_source = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (current_price, move, 1 if move >= OBS_SUCCESS_THRESHOLD else 0, now_iso, row["id"]),
+                    (current_price, move, 1 if move >= OBS_SUCCESS_THRESHOLD else 0, price_source, now_iso, row["id"]),
                 )
                 updated["one_hour"] += 1
 
@@ -1098,10 +1206,10 @@ def evaluate_due_observations() -> Dict[str, int]:
                 cur.execute(
                     """
                     UPDATE observed_trades
-                    SET price_6h = ?, move_6h = ?, success_6h = ?, updated_at = ?
+                    SET price_6h = ?, move_6h = ?, success_6h = ?, price_source = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (current_price, move, 1 if move >= OBS_SUCCESS_THRESHOLD else 0, now_iso, row["id"]),
+                    (current_price, move, 1 if move >= OBS_SUCCESS_THRESHOLD else 0, price_source, now_iso, row["id"]),
                 )
                 updated["six_hour"] += 1
 
@@ -1109,10 +1217,10 @@ def evaluate_due_observations() -> Dict[str, int]:
                 cur.execute(
                     """
                     UPDATE observed_trades
-                    SET price_24h = ?, move_24h = ?, success_24h = ?, status = 'closed', updated_at = ?
+                    SET price_24h = ?, move_24h = ?, success_24h = ?, price_source = ?, status = 'closed', updated_at = ?
                     WHERE id = ?
                     """,
-                    (current_price, move, 1 if move >= OBS_SUCCESS_THRESHOLD else 0, now_iso, row["id"]),
+                    (current_price, move, 1 if move >= OBS_SUCCESS_THRESHOLD else 0, price_source, now_iso, row["id"]),
                 )
                 updated["twenty_four_hour"] += 1
         conn.commit()
@@ -1177,11 +1285,20 @@ def top_observed_wallets(limit: int = 10) -> List[Dict[str, Any]]:
                 SUM(CASE WHEN success_24h IS NOT NULL THEN 1 ELSE 0 END) AS sample_24h,
                 AVG(CASE WHEN success_24h IS NOT NULL THEN success_24h END) AS success_rate_24h,
                 AVG(CASE WHEN move_24h IS NOT NULL THEN move_24h END) AS avg_move_24h,
+                SUM(CASE WHEN success_6h IS NOT NULL THEN 1 ELSE 0 END) AS sample_6h,
+                AVG(CASE WHEN success_6h IS NOT NULL THEN success_6h END) AS success_rate_6h,
+                AVG(CASE WHEN move_6h IS NOT NULL THEN move_6h END) AS avg_move_6h,
+                SUM(CASE WHEN success_1h IS NOT NULL THEN 1 ELSE 0 END) AS sample_1h,
+                AVG(CASE WHEN success_1h IS NOT NULL THEN success_1h END) AS success_rate_1h,
+                AVG(CASE WHEN move_1h IS NOT NULL THEN move_1h END) AS avg_move_1h,
                 MAX(snapshot_score) AS max_snapshot_score
             FROM observed_trades
             GROUP BY wallet
-            HAVING sample_24h > 0
-            ORDER BY success_rate_24h DESC, sample_24h DESC, avg_move_24h DESC
+            HAVING sample_24h > 0 OR sample_6h > 0 OR sample_1h > 0
+            ORDER BY
+                COALESCE(success_rate_24h, success_rate_6h, success_rate_1h) DESC,
+                COALESCE(sample_24h, sample_6h, sample_1h) DESC,
+                COALESCE(avg_move_24h, avg_move_6h, avg_move_1h) DESC
             LIMIT ?
             """,
             (limit,),
